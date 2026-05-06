@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
+from isales_telephony.api.health_monitor import build_scheduler
 from isales_telephony.api.routers import device_sim_bindings, devices, select, sim_cards
 from isales_telephony.common.db import get_engine, get_sessionmaker
 
@@ -16,11 +17,16 @@ from isales_telephony.common.db import get_engine, get_sessionmaker
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = get_engine()
+    sessionmaker = get_sessionmaker(engine)
     app.state.engine = engine
-    app.state.sessionmaker = get_sessionmaker(engine)
+    app.state.sessionmaker = sessionmaker
+    scheduler = build_scheduler(sessionmaker)
+    scheduler.start()
+    app.state.scheduler = scheduler
     try:
         yield
     finally:
+        scheduler.shutdown(wait=False)
         await engine.dispose()
 
 
