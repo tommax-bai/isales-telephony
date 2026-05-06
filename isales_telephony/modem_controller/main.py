@@ -18,6 +18,7 @@ from isales_telephony.common.db import get_engine, get_sessionmaker
 from isales_telephony.modem_controller.at_client import MockATClient
 from isales_telephony.modem_controller.handlers import build_handlers
 from isales_telephony.modem_controller.ipc_server import IPCServer
+from isales_telephony.modem_controller.udev_watcher import start_udev_watcher
 
 logger = logging.getLogger("isales.modem_controller")
 
@@ -39,10 +40,13 @@ async def main() -> None:
     server = IPCServer(_socket_path(), handlers)
     await server.start()
     logger.info("modem-controller IPC server listening on %s", server.socket_path)
+    udev_task = await start_udev_watcher(sm) if sm is not None else None
     try:
         await server.serve_forever()
     finally:
         await server.stop()
+        if udev_task is not None:
+            udev_task.cancel()
         if engine is not None:
             await engine.dispose()
 
