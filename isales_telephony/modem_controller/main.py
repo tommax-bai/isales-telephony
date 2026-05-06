@@ -1,23 +1,38 @@
 """modem-controller asyncio daemon entrypoint.
 
-PR #2 (skeleton) only runs the event loop; PR #6 adds the IPC server, PR #7
-the AT client + dial mock, PR #8 the udev watcher.
+Phase 2 wiring:
+- IPC server (Unix socket, newline-delimited JSON) — PR #6
+- AT client / dial mock                            — PR #7
+- udev watcher                                     — PR #8
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+
+from isales_telephony.modem_controller.handlers import DEFAULT_HANDLERS
+from isales_telephony.modem_controller.ipc_server import IPCServer
 
 logger = logging.getLogger("isales.modem_controller")
+
+DEFAULT_SOCKET_PATH = "/var/run/isales/modem.sock"
+
+
+def _socket_path() -> str:
+    return os.environ.get("ISALES_MODEM_SOCKET", DEFAULT_SOCKET_PATH)
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    logger.info("modem-controller started (skeleton; PR #6 wires the IPC server)")
-    # Block until the process is signalled. Subsequent PRs replace this with the
-    # IPC server / udev watcher gather().
-    await asyncio.Event().wait()
+    server = IPCServer(_socket_path(), DEFAULT_HANDLERS)
+    await server.start()
+    logger.info("modem-controller IPC server listening on %s", server.socket_path)
+    try:
+        await server.serve_forever()
+    finally:
+        await server.stop()
 
 
 def run() -> None:
