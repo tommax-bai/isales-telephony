@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: isales
+          POSTGRES_PASSWORD: isales
+          POSTGRES_DB: isales_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ISALES_DATABASE_URL: postgresql+asyncpg://isales:isales@localhost:5432/isales_test
+      ISALES_REDIS_URL: redis://localhost:6379/0
+      ISALES_JWT_SECRET: test-secret-do-not-use-in-prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Until isales-common is on a private package index, install it from a
+      # tagged git URL. This requires v0.1.2 to be tagged in the isales-common
+      # repo (impl-telephony tasks 1.6/1.7).
+      - name: Install isales-common (v0.1.2 git tag)
+        run: pip install "isales-common @ git+https://github.com/tommax-bai/isales-common@v0.1.2"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy isales_telephony
+
+      - name: Pytest
+        run: pytest -v
