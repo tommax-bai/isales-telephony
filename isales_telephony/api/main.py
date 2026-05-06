@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from isales_telephony.api.routers import device_sim_bindings, devices, sim_cards
+from isales_telephony.api.routers import device_sim_bindings, devices, select, sim_cards
 from isales_telephony.common.db import get_engine, get_sessionmaker
 
 
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(devices.router)
     app.include_router(sim_cards.router)
     app.include_router(device_sim_bindings.router)
+    app.include_router(select.router)
     return app
 
 

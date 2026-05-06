@@ -59,7 +59,8 @@ async def clean_engine(engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
     """Truncate the tables this PR touches before each test."""
     async with engine.begin() as conn:
         await conn.exec_driver_sql(
-            "TRUNCATE device, sim_card, device_sim_binding RESTART IDENTITY CASCADE"
+            "TRUNCATE device, sim_card, device_sim_binding, campaign, "
+            "campaign_device RESTART IDENTITY CASCADE"
         )
     yield engine
 
