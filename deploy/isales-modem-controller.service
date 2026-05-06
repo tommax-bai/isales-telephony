@@ -1,0 +1,39 @@
+[Unit]
+Description=isales modem-controller (IPC + udev)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=isales
+Group=isales
+ExecStart=/opt/isales/venv/bin/modem-controller
+Restart=on-failure
+RestartSec=5
+
+# RuntimeDirectory ensures /var/run/isales/ exists and is owned by isales.
+# The Unix socket lands at /var/run/isales/modem.sock (default path).
+RuntimeDirectory=isales
+RuntimeDirectoryMode=0750
+
+# udev access requires the isales user to be in plugdev (Debian/Ubuntu) or
+# the equivalent group on your distribution.
+SupplementaryGroups=plugdev dialout
+
+Environment=ISALES_DATABASE_URL=postgresql+asyncpg://isales:isales@localhost:5432/isales
+Environment=ISALES_MODEM_SOCKET=/var/run/isales/modem.sock
+# ISALES_SKIP_UDEV is unset in prod (Linux). Useful in dev/macOS only.
+
+# Mock-AT timing — leave defaults in stage 2; stage 6 sets these to 0 since the
+# real serial AT client doesn't honour them.
+# Environment=MOCK_DIAL_DELAY_MS=1000
+# Environment=MOCK_CALL_DURATION_MS=5000
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target
