@@ -24,6 +24,12 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",
     'pyudev>=0.24; platform_system == "Linux"',
+    # pyserial is cross-platform (Linux /dev/ttyUSB*, macOS /dev/cu.usbmodem*,
+    # Windows COM*). modem-controller uses pyserial.tools.list_ports for
+    # device discovery on every platform; impl-deploy-macos PR #5 promoted it
+    # from Linux-only extras to cross-platform main deps.
+    "pyserial>=3.5",
+    "pyserial-asyncio>=0.6",
 ]
 
 [project.optional-dependencies]
@@ -35,14 +41,32 @@ dev = [
     "mypy>=1.8",
     "types-redis",
 ]
-# Linux-only modem-controller deps. Install with `pip install -e ".[hardware]"`
-# on a real device host. macOS / Windows dev hosts can't satisfy these and
-# don't need to (recorder / audio_pipe / drivers are unit-tested without
-# real ALSA / serial via pure-Python mocks).
+# Legacy alias for stage 6 Linux ALSA work. After impl-deploy-macos PR #5,
+# pyserial moved to main `dependencies`; this group is now ALSA-only.
 hardware = [
-    'pyserial>=3.5; platform_system == "Linux"',
-    'pyserial-asyncio>=0.6; platform_system == "Linux"',
     'pyalsaaudio>=0.10; platform_system == "Linux"',
+]
+# Linux backend extras (impl-deploy-macos PR #2). pyudev + pyserial are
+# already in main `dependencies` (with platform markers where needed); this
+# alias only adds the ALSA audio bit.
+linux = [
+    'pyalsaaudio>=0.10; platform_system == "Linux"',
+]
+# macOS backend extras (impl-deploy-macos PR #2). Apple Silicon + macOS 14+
+# only — see openspec/specs/architecture for the platform contract.
+# Install with `pip install -e ".[macos]"` on a Mac dev / production host.
+#
+# Note: USB hot-plug detection on macOS uses `pyserial.tools.list_ports`
+# polling (1 Hz cadence is adequate — GSM modems take 3–5 s to become usable
+# after insertion). We deliberately do NOT depend on pyobjc-framework-IOKit
+# because that package is not published separately on PyPI; ctypes-based
+# IOKit access is reserved for follow-up if polling proves insufficient.
+#
+# sounddevice is cross-platform (PortAudio → Core Audio on macOS, ALSA on
+# Linux). It is the macOS audio backend; on Linux we keep `pyalsaaudio` as
+# the canonical option (`hardware` / `linux` extras above).
+macos = [
+    'sounddevice>=0.4.6',
 ]
 
 [project.scripts]
@@ -85,6 +109,17 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "apscheduler.*"
+ignore_missing_imports = true
+
+# pyserial ships no type stubs (PEP-561); we only call the well-known
+# `comports()` / `ListPortInfo.{device,vid,pid,serial_number}` shape.
+[[tool.mypy.overrides]]
+module = "serial.*"
+ignore_missing_imports = true
+
+# sounddevice ships no type stubs.
+[[tool.mypy.overrides]]
+module = "sounddevice"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

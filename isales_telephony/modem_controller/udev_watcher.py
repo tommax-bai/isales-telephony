@@ -1,18 +1,24 @@
-"""udev event watcher (Linux-only at runtime; mockable for tests).
+"""USB device watcher — domain logic + Linux/macOS dispatch.
 
-This module monitors USB serial / TTY device add/remove events. When a known
-GSM modem (matched by USB vendor/product ID against ``GSM_MODEM_WHITELIST``)
-is plugged in, we update ``device.last_seen_at`` so the modem's row reflects
-the recent presence; on remove we flip ``status`` to OFFLINE so the
-/devices/select query stops considering it.
+This module is intentionally light after impl-deploy-macos PR #1: the
+platform-specific event source moved to
+:mod:`isales_telephony.modem_controller.platforms`, and this file now
+holds only the cross-platform domain logic (modem-whitelist match, DB
+write-back, dispatch helper).
 
-v1 stage 2 deliberately does NOT issue AT commands here — full identification
-(query ICCID, IMEI, signal) is stage 6 territory. The whitelist match is by
-USB ID alone; mapping a freshly-plugged dongle to a particular ``device`` row
-needs serial-number reading (also stage 6).
+Public API (kept stable for legacy callers and the 115 stage-2 tests):
 
-macOS / non-Linux hosts have no usable pyudev. ``ISALES_SKIP_UDEV=1`` (or
-``platform.system() != "Linux"``) makes :func:`start_udev_watcher` a no-op.
+- :class:`UdevEvent` — re-exported from ``platforms.base``
+- :data:`GSM_MODEM_WHITELIST` — vendor/product allowlist
+- :func:`consume_events` — pump events into DB updates
+- :func:`fake_events` — wrap an iterable as AsyncIterator (test helper)
+- :func:`start_udev_watcher` — spawn background task; no-op on non-Linux
+  with ``ISALES_SKIP_UDEV=1`` (legacy macOS dev mode); on macOS without
+  the env var, dispatches to MacOSIokitWatcher (raises NotImplementedError
+  until impl-deploy-macos PR #3).
+
+v1 stage 2 deliberately does NOT issue AT commands here — full
+identification (query ICCID, IMEI, signal) is stage 6 territory.
 """
 
 from __future__ import annotations
@@ -21,14 +27,16 @@ import asyncio
 import logging
 import os
 import platform
+import sys
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from isales_common.enums import DeviceStatus
 from isales_common.models import Device
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from .platforms import UdevEvent, UsbDeviceWatcherError, get_usb_watcher_class
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +45,6 @@ logger = logging.getLogger(__name__)
 GSM_MODEM_WHITELIST: set[tuple[str, str]] = {
     ("2c7c", "0125"),  # Quectel EC25 (placeholder; verify in stage 6)
 }
-
-
-@dataclass(frozen=True)
-class UdevEvent:
-    action: str  # "add" | "remove" | "change"
-    device_node: str | None
-    vendor_id: str | None
-    product_id: str | None
 
 
 def _is_known_modem(ev: UdevEvent) -> bool:
@@ -58,7 +58,7 @@ async def _on_event(
 ) -> None:
     if ev.action == "add":
         if not _is_known_modem(ev):
-            logger.debug("udev add: ignoring unknown device %s", ev)
+            logger.debug("usb add: ignoring unknown device %s", ev)
             return
         await _touch_last_seen(sm, ev.device_node)
     elif ev.action == "remove":
@@ -77,7 +77,7 @@ async def _touch_last_seen(
             )
         ).scalar_one_or_none()
         if dev is None:
-            logger.info("udev add: device_node %s not in DB yet", device_node)
+            logger.info("usb add: device_node %s not in DB yet", device_node)
             return
         dev.last_seen_at = datetime.now(tz=UTC)
         await session.commit()
@@ -103,55 +103,52 @@ async def _mark_offline(
 async def consume_events(
     sm: async_sessionmaker[AsyncSession], events: AsyncIterator[UdevEvent]
 ) -> None:
-    """Pump udev events into DB updates. Returns when the iterator ends."""
+    """Pump USB events into DB updates. Returns when the iterator ends."""
     async for ev in events:
         try:
             await _on_event(sm, ev)
         except Exception:
-            logger.exception("udev: event handler failed for %s", ev)
+            logger.exception("usb watcher: event handler failed for %s", ev)
 
 
 def _platform_skip() -> bool:
-    return os.environ.get("ISALES_SKIP_UDEV") == "1" or platform.system() != "Linux"
+    """Legacy escape hatch: ``ISALES_SKIP_UDEV=1`` disables the watcher
+    entirely. Used by non-Linux dev environments before macOS support
+    landed; kept for forward compatibility.
+    """
+    return os.environ.get("ISALES_SKIP_UDEV") == "1"
 
 
 async def start_udev_watcher(
     sm: async_sessionmaker[AsyncSession],
 ) -> asyncio.Task[None] | None:
-    """Start the udev watcher as a background task. No-op on non-Linux."""
+    """Start the USB watcher as a background task.
+
+    Returns ``None`` when ``ISALES_SKIP_UDEV=1`` is set (legacy dev escape
+    hatch). On unsupported platforms, propagates :class:`UsbDeviceWatcherError`
+    from :func:`platforms.get_usb_watcher_class` so the caller fails fast
+    rather than silently no-op.
+    """
     if _platform_skip():
-        logger.info("udev_watcher: skipped (platform=%s)", platform.system())
+        logger.info("usb watcher: skipped via ISALES_SKIP_UDEV=1 (platform=%s)", platform.system())
         return None
 
-    # Lazy import — pyudev is Linux-only.
-    import pyudev  # noqa: PLC0415
+    watcher_cls = get_usb_watcher_class()
+    watcher = watcher_cls()
+    await watcher.start()
+    logger.info(
+        "usb watcher: started (platform=%s, impl=%s)",
+        sys.platform,
+        watcher_cls.__name__,
+    )
 
-    async def _events() -> AsyncIterator[UdevEvent]:
-        ctx = pyudev.Context()
-        monitor = pyudev.Monitor.from_netlink(ctx)
-        monitor.filter_by(subsystem="tty")
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[UdevEvent] = asyncio.Queue()
-
-        def _on_pyudev(device: pyudev.Device) -> None:
-            ev = UdevEvent(
-                action=str(getattr(device, "action", "")),
-                device_node=getattr(device, "device_node", None),
-                vendor_id=device.get("ID_VENDOR_ID"),
-                product_id=device.get("ID_MODEL_ID"),
-            )
-            loop.call_soon_threadsafe(queue.put_nowait, ev)
-
-        observer = pyudev.MonitorObserver(monitor, callback=_on_pyudev)
-        observer.start()
+    async def _consume() -> None:
         try:
-            while True:
-                yield await queue.get()
+            await consume_events(sm, watcher.events())
         finally:
-            observer.stop()
+            await watcher.stop()
 
-    task = asyncio.create_task(consume_events(sm, _events()))
-    return task
+    return asyncio.create_task(_consume())
 
 
 def fake_events(events: Iterable[UdevEvent]) -> AsyncIterator[UdevEvent]:
@@ -162,3 +159,13 @@ def fake_events(events: Iterable[UdevEvent]) -> AsyncIterator[UdevEvent]:
             yield ev
 
     return _gen()
+
+
+__all__ = [
+    "GSM_MODEM_WHITELIST",
+    "UdevEvent",
+    "UsbDeviceWatcherError",
+    "consume_events",
+    "fake_events",
+    "start_udev_watcher",
+]

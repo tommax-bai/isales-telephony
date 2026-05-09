@@ -18,14 +18,21 @@ tasks.
 # 1. install isales-common from the local sibling (development snapshot of v0.1.2)
 pip install -e ../isales-common
 
-# 2. install this package + dev tools
-pip install -e ".[dev]"
+# 2. install this package + dev tools + the platform-appropriate hardware extras.
+#    Linux dev / production host:
+pip install -e ".[dev,linux]"
+#    macOS Apple Silicon dev / production host (impl-deploy-macos):
+pip install -e ".[dev,macos]"
 
 # 3. environment
 export ISALES_DATABASE_URL=postgresql+asyncpg://bears@localhost:5432/isales_dev
 export ISALES_JWT_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
 export ISALES_REDIS_URL=redis://localhost:6379/0
-export ISALES_SKIP_UDEV=1   # macOS only — pyudev is Linux-only
+# Legacy escape hatch (pre-impl-deploy-macos): set on macOS dev hosts to
+# skip the USB watcher entirely. With the macos extras installed, you can
+# now leave this unset and the IOKit watcher will start (impl-deploy-macos
+# PR #3 lands the real IOKit subscription; until then it raises NotImplementedError).
+export ISALES_SKIP_UDEV=1
 
 # 4. run (two terminals)
 telephony-api          # FastAPI on :8001
