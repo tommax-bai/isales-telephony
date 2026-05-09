@@ -60,6 +60,12 @@ def build_handlers(
         number = msg.get("number")
         if not isinstance(number, str):
             return {"error": "invalid_request", "detail": "number required"}
+        # session_id is the spec-aligned correlation key (device-hardware
+        # spec § engine ↔ modem-controller IPC 协议). When the engine passes
+        # one we echo it on the ack and on every async event so the engine
+        # side can route by its own int call_id without needing to learn
+        # the modem's UUID.
+        session_id = msg.get("session_id") if isinstance(msg.get("session_id"), str) else None
 
         await _set_device_status(sm, device_id, DeviceStatus.DIALING)
         call_id, events = await client.dial(number)
@@ -72,6 +78,8 @@ def build_handlers(
                     elif ev.event == "remote_hangup":
                         await _set_device_status(sm, device_id, DeviceStatus.IDLE)
                     payload: dict[str, Any] = {"event": ev.event, "call_id": ev.call_id}
+                    if session_id is not None:
+                        payload["session_id"] = session_id
                     if ev.cause:
                         payload["cause"] = ev.cause
                     if device_id is not None:
@@ -81,13 +89,20 @@ def build_handlers(
                 logger.exception("dial handler event pump failed (call_id=%s)", call_id)
 
         asyncio.create_task(_pump())
-        return {"event": "dial_ack", "call_id": call_id}
+        ack: dict[str, Any] = {"event": "dial_ack", "call_id": call_id}
+        if session_id is not None:
+            ack["session_id"] = session_id
+        return ack
 
     async def handle_hangup(_conn: Connection, msg: dict[str, Any]) -> dict[str, Any]:
         call_id = msg.get("call_id")
         if isinstance(call_id, str):
             await client.hangup(call_id)
-        return {"event": "hangup_ack"}
+        ack: dict[str, Any] = {"event": "hangup_ack"}
+        session_id = msg.get("session_id")
+        if isinstance(session_id, str):
+            ack["session_id"] = session_id
+        return ack
 
     async def handle_audio_downstream(
         _conn: Connection, msg: dict[str, Any]

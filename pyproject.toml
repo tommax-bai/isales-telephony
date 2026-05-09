@@ -19,6 +19,10 @@ dependencies = [
     "alembic>=1.13",
     "redis>=5.0",
     "apscheduler>=3.10",
+    "httpx>=0.27",
+    "structlog>=24.1",
+    "numpy>=1.26",
+    "scipy>=1.12",
     'pyudev>=0.24; platform_system == "Linux"',
 ]
 
@@ -26,14 +30,19 @@ dependencies = [
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",
     "testcontainers[postgres]>=4.0",
     "ruff>=0.3",
     "mypy>=1.8",
     "types-redis",
 ]
+# Linux-only modem-controller deps. Install with `pip install -e ".[hardware]"`
+# on a real device host. macOS / Windows dev hosts can't satisfy these and
+# don't need to (recorder / audio_pipe / drivers are unit-tested without
+# real ALSA / serial via pure-Python mocks).
 hardware = [
-    "pyserial>=3.5",
+    'pyserial>=3.5; platform_system == "Linux"',
+    'pyserial-asyncio>=0.6; platform_system == "Linux"',
+    'pyalsaaudio>=0.10; platform_system == "Linux"',
 ]
 
 [project.scripts]

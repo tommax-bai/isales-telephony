@@ -1,6 +1,8 @@
 [Unit]
-Description=isales modem-controller (IPC + udev)
-After=network-online.target postgresql.service
+Description=isales modem-controller (IPC + udev + AT + ALSA)
+# Wait for udev settle + sound subsystem before reaching for /dev/ttyUSB-* and
+# /dev/snd/by-id/usb-isales-modem (created by 99-isales-modem.rules).
+After=systemd-udev-settle.service sound.target network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
@@ -10,27 +12,37 @@ Group=isales
 ExecStart=/opt/isales/venv/bin/modem-controller
 Restart=on-failure
 RestartSec=5
+StartLimitBurst=5
 
 # RuntimeDirectory ensures /var/run/isales/ exists and is owned by isales.
 # The Unix socket lands at /var/run/isales/modem.sock (default path).
 RuntimeDirectory=isales
 RuntimeDirectoryMode=0750
 
-# udev access requires the isales user to be in plugdev (Debian/Ubuntu) or
-# the equivalent group on your distribution.
-SupplementaryGroups=plugdev dialout
+# StateDirectory is created on first start and persists across boots — local
+# wav recordings live here until isales-worker uploads them to OSS.
+StateDirectory=isales
+StateDirectoryMode=0750
 
+# udev / serial / audio access. The isales user needs:
+#  - dialout: for /dev/ttyUSB* serial
+#  - audio:   for /dev/snd/* PCM
+#  - plugdev: for hot-plug events (Debian/Ubuntu convention)
+SupplementaryGroups=plugdev dialout audio
+
+EnvironmentFile=-/etc/isales/modem-controller.env
 Environment=ISALES_DATABASE_URL=postgresql+asyncpg://isales:isales@localhost:5432/isales
 Environment=ISALES_MODEM_SOCKET=/var/run/isales/modem.sock
-# ISALES_SKIP_UDEV is unset in prod (Linux). Useful in dev/macOS only.
-
-# Mock-AT timing — leave defaults in stage 2; stage 6 sets these to 0 since the
-# real serial AT client doesn't honour them.
-# Environment=MOCK_DIAL_DELAY_MS=1000
-# Environment=MOCK_CALL_DURATION_MS=5000
+Environment=ISALES_MODEM_RECORDING_DIR=/var/lib/isales/recordings
+# Override per host:
+#   ISALES_MODEM_SERIAL_PATH (default /dev/ttyUSB-isales-modem via 99-isales-modem.rules)
+#   ISALES_MODEM_ALSA_CARD   (default 'default'; use 'hw:Loopback,0' for fake-modem CI)
+#   ISALES_MODEM_DRIVER      (default auto-detect via AT+GMI/AT+GMM)
 
 NoNewPrivileges=true
+# Allow read+write to the runtime + state directories despite ProtectSystem.
 ProtectSystem=strict
+ReadWritePaths=/var/run/isales /var/lib/isales
 ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true

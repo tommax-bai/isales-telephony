@@ -1,17 +1,31 @@
-"""/devices CRUD."""
+"""/devices CRUD + modem-controller heartbeat endpoint."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 from isales_common.enums import DeviceStatus
 from isales_common.models import Device
+from isales_common.schemas._base import AppModel
 from isales_common.schemas.device import DeviceCreate, DeviceRead, DeviceUpdate
+from pydantic import Field
 from sqlalchemy import func, select
 
 from isales_telephony.api.deps import CurrentUser, DBSession
 from isales_telephony.api.schemas import Page
+
+
+class HeartbeatPayload(AppModel):
+    """Body of POST /devices/{id}/heartbeat — modem-controller side only.
+
+    ``signal_strength`` belongs to sim_card per data-model spec, not device;
+    accept it here so future bindings can fan it out to the active sim row
+    (v1 logs and ignores). v1 only writes ``last_seen_at``.
+    """
+
+    signal_strength: int | None = Field(default=None, ge=0, le=99)
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -80,3 +94,27 @@ async def delete_device(device_id: int, session: DBSession, _user: CurrentUser) 
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device_not_found")
     await session.delete(obj)
+
+
+@router.patch("/{device_id}/heartbeat", status_code=status.HTTP_204_NO_CONTENT)
+async def device_heartbeat(
+    device_id: int,
+    payload: HeartbeatPayload,
+    session: DBSession,
+    _user: CurrentUser,
+) -> None:
+    """Refresh ``last_seen_at`` + ``signal_strength`` only.
+
+    Spec: device-hardware § modem-controller 心跳与失联探测 — this endpoint
+    MUST NOT touch ``status`` / ``last_call_at`` / ``imei`` etc. The
+    modem-controller daemon hits it every 30s; the worker watchdog (separate
+    process) flips long-stale rows to ``offline``.
+    """
+
+    obj = await session.get(Device, device_id)
+    if obj is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device_not_found")
+    obj.last_seen_at = datetime.now(tz=UTC)
+    # signal_strength is a sim_card column; v1 accepts it on the body but
+    # doesn't fan out — see HeartbeatPayload docstring.
+    _ = payload.signal_strength
