@@ -35,12 +35,20 @@ class FrameError(Exception):
 
 
 class Connection:
-    """One peer connection. Owns its writer; safe to call ``send`` from anywhere."""
+    """One peer connection. Owns its writer; safe to call ``send`` from anywhere.
+
+    Background coroutines spawned by handlers (``_pump`` for dial events) MUST
+    observe ``cancel_event`` and bail out when it is set, so we don't keep
+    writing to a closed socket — and, more importantly, don't keep writing
+    to ``device.status`` after the test that owns the connection has moved
+    on. ``IPCServer._on_connect`` sets the event in its ``finally`` block.
+    """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader = reader
         self.writer = writer
         self._send_lock = asyncio.Lock()
+        self.cancel_event: asyncio.Event = asyncio.Event()
 
     async def send(self, msg: dict[str, Any]) -> None:
         line = json.dumps(msg, ensure_ascii=False).encode() + b"\n"
@@ -49,6 +57,10 @@ class Connection:
         async with self._send_lock:
             self.writer.write(line)
             await self.writer.drain()
+
+    @property
+    def closed(self) -> bool:
+        return self.cancel_event.is_set()
 
     @property
     def peer(self) -> str:
@@ -94,6 +106,10 @@ class IPCServer:
         except Exception:
             logger.exception("ipc_server: handler error")
         finally:
+            # Signal background coroutines (dial event pumps) to bail before
+            # we close the writer; otherwise they race with subsequent tests
+            # writing to device.status via the shared sessionmaker.
+            conn.cancel_event.set()
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()

@@ -145,8 +145,12 @@ async def test_legacy_clients_without_session_id_still_work(
         await writer.drain()
         ack = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
         assert ack["event"] == "dial_ack"
-        # No session_id in ack since none was supplied.
-        assert "session_id" not in ack
+        # PR #2 of prep-stage8-cleanup: when caller omits session_id, the
+        # handler now falls back to the modem-side UUID so the wire frame
+        # always carries exactly one correlation key. ``call_id`` field is
+        # gone for good.
+        assert isinstance(ack["session_id"], str)
+        assert "call_id" not in ack
         # Drain connected + remote_hangup so the handler's pump task ends
         # before the fixture tears down — otherwise the pump survives this
         # test and races with downstream tests' device.status writes via

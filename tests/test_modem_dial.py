@@ -89,7 +89,11 @@ async def test_dial_emits_connected_then_hangup_and_flips_status(
 
         ack = await _read_msg()
         assert ack["event"] == "dial_ack"
-        assert isinstance(ack["call_id"], str)
+        assert isinstance(ack["session_id"], str)
+        # PR #2 of prep-stage8-cleanup removes ``call_id`` from wire frames —
+        # session_id is the single correlation field per spec § engine ↔
+        # modem-controller IPC 协议.
+        assert "call_id" not in ack
 
         # Right after dial, device.status should be DIALING.
         async with sm() as session:
@@ -99,8 +103,9 @@ async def test_dial_emits_connected_then_hangup_and_flips_status(
 
         connected = await _read_msg()
         assert connected["event"] == "connected"
-        assert connected["call_id"] == ack["call_id"]
+        assert connected["session_id"] == ack["session_id"]
         assert connected["device_id"] == device_id
+        assert "call_id" not in connected
 
         # status is now IN_CALL
         async with sm() as session:
@@ -110,8 +115,9 @@ async def test_dial_emits_connected_then_hangup_and_flips_status(
 
         hangup = await _read_msg()
         assert hangup["event"] == "remote_hangup"
-        assert hangup["call_id"] == ack["call_id"]
+        assert hangup["session_id"] == ack["session_id"]
         assert hangup["cause"] == "normal_clearing"
+        assert "call_id" not in hangup
 
         # status back to IDLE
         async with sm() as session:
@@ -145,14 +151,16 @@ async def test_hangup_command_short_circuits_call(
         )
         await writer.drain()
         ack = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
-        call_id = ack["call_id"]
+        session_id = ack["session_id"]
 
         # immediately hang up — before MOCK_DIAL_DELAY_MS elapses
-        writer.write(json.dumps({"cmd": "hangup", "call_id": call_id}).encode() + b"\n")
+        writer.write(
+            json.dumps({"cmd": "hangup", "session_id": session_id}).encode() + b"\n"
+        )
         await writer.drain()
-        # hangup_ack arrives synchronously
+        # hangup_ack arrives synchronously and echoes the same session_id
         ack2 = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
-        assert ack2 == {"event": "hangup_ack"}
+        assert ack2 == {"event": "hangup_ack", "session_id": session_id}
 
         # The dial event stream should now emit remote_hangup with local_clearing
         # (no connected event since we cancelled before the delay).

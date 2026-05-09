@@ -51,6 +51,10 @@ def build_handlers(
 ) -> Mapping[str, Handler]:
     """Build the handler dict. Dial/hangup close over the AT client and DB."""
     client = at_client or MockATClient()
+    # session_id → modem-side call_id mapping for hangup routing.
+    # Caller-provided session_ids index into this; modem-fallback session_ids
+    # equal the modem call_id directly so the lookup is still consistent.
+    session_to_call: dict[str, str] = {}
 
     async def handle_status(_conn: Connection, _msg: dict[str, Any]) -> dict[str, Any]:
         return {"event": "status", "status": "ok"}
@@ -61,46 +65,68 @@ def build_handlers(
         if not isinstance(number, str):
             return {"error": "invalid_request", "detail": "number required"}
         # session_id is the spec-aligned correlation key (device-hardware
-        # spec § engine ↔ modem-controller IPC 协议). When the engine passes
-        # one we echo it on the ack and on every async event so the engine
-        # side can route by its own int call_id without needing to learn
-        # the modem's UUID.
-        session_id = msg.get("session_id") if isinstance(msg.get("session_id"), str) else None
+        # spec § engine ↔ modem-controller IPC 协议). Caller-provided when
+        # available; if absent we fall back to the modem-side UUID so the
+        # contract still gives the peer a single field to route on.
+        caller_session_id = (
+            msg.get("session_id") if isinstance(msg.get("session_id"), str) else None
+        )
 
         await _set_device_status(sm, device_id, DeviceStatus.DIALING)
-        call_id, events = await client.dial(number)
+        modem_call_id, events = await client.dial(number)
+        session_id = caller_session_id or modem_call_id
+        session_to_call[session_id] = modem_call_id
 
         async def _pump() -> None:
             try:
                 async for ev in events:
+                    if conn.closed:
+                        break
                     if ev.event == "connected":
                         await _set_device_status(sm, device_id, DeviceStatus.IN_CALL)
                     elif ev.event == "remote_hangup":
                         await _set_device_status(sm, device_id, DeviceStatus.IDLE)
-                    payload: dict[str, Any] = {"event": ev.event, "call_id": ev.call_id}
-                    if session_id is not None:
-                        payload["session_id"] = session_id
+                    if conn.closed:
+                        break
+                    payload: dict[str, Any] = {
+                        "event": ev.event,
+                        "session_id": session_id,
+                    }
                     if ev.cause:
                         payload["cause"] = ev.cause
                     if device_id is not None:
                         payload["device_id"] = device_id
-                    await conn.send(payload)
+                    try:
+                        await conn.send(payload)
+                    except (ConnectionResetError, BrokenPipeError):
+                        break
             except Exception:
-                logger.exception("dial handler event pump failed (call_id=%s)", call_id)
+                logger.exception(
+                    "dial handler event pump failed (session_id=%s)", session_id
+                )
+            finally:
+                session_to_call.pop(session_id, None)
 
         asyncio.create_task(_pump())
-        ack: dict[str, Any] = {"event": "dial_ack", "call_id": call_id}
-        if session_id is not None:
-            ack["session_id"] = session_id
-        return ack
+        return {"event": "dial_ack", "session_id": session_id}
 
     async def handle_hangup(_conn: Connection, msg: dict[str, Any]) -> dict[str, Any]:
-        call_id = msg.get("call_id")
-        if isinstance(call_id, str):
-            await client.hangup(call_id)
+        # Prefer session_id (spec); fall back to legacy ``call_id`` so
+        # transitional callers (CLI debug scripts) still work. Either form
+        # routes to the same modem-side call.
+        session_id = (
+            msg.get("session_id") if isinstance(msg.get("session_id"), str) else None
+        )
+        legacy_call_id = (
+            msg.get("call_id") if isinstance(msg.get("call_id"), str) else None
+        )
+        modem_call_id = (
+            session_to_call.get(session_id) if session_id else None
+        ) or legacy_call_id
+        if isinstance(modem_call_id, str):
+            await client.hangup(modem_call_id)
         ack: dict[str, Any] = {"event": "hangup_ack"}
-        session_id = msg.get("session_id")
-        if isinstance(session_id, str):
+        if session_id is not None:
             ack["session_id"] = session_id
         return ack
 
