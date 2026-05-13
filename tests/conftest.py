@@ -18,6 +18,11 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 
+# impl-real-at: tests run without a real GSM modem. Opt the ATClient dispatcher
+# (modem_controller/main.py:_make_at_client) into MockATClient mode for every
+# test process — production deployments MUST NOT set this var.
+os.environ.setdefault("ISALES_ALLOW_MOCK_AT", "1")
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient

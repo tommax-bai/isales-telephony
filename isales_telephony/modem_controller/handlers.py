@@ -22,7 +22,7 @@ from isales_common.enums import DeviceStatus
 from isales_common.models import Device
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from isales_telephony.modem_controller.at_client import ATClient, MockATClient
+from isales_telephony.modem_controller.at_client import ATClient
 from isales_telephony.modem_controller.ipc_server import Connection, Handler
 
 logger = logging.getLogger(__name__)
@@ -46,11 +46,17 @@ async def _set_device_status(
 
 def build_handlers(
     *,
-    at_client: ATClient | None = None,
+    at_client: ATClient,
     sm: async_sessionmaker[AsyncSession] | None = None,
 ) -> Mapping[str, Handler]:
-    """Build the handler dict. Dial/hangup close over the AT client and DB."""
-    client = at_client or MockATClient()
+    """Build the handler dict. Dial/hangup close over the AT client and DB.
+
+    ``at_client`` is required (impl-real-at): the caller chooses
+    ``SerialATClient`` (production) or ``MockATClient`` (CI / dev) explicitly.
+    Defaulting to MockATClient inside the handler factory let production
+    misconfiguration silently run against a mock — that mode is gone.
+    """
+    client = at_client
     # session_id → modem-side call_id mapping for hangup routing.
     # Caller-provided session_ids index into this; modem-fallback session_ids
     # equal the modem call_id directly so the lookup is still consistent.
@@ -146,6 +152,12 @@ def build_handlers(
     }
 
 
-# Convenience for callers that don't need an AT client / DB hook (e.g. PR #6
-# tests). Equivalent to ``build_handlers()`` with all defaults.
-DEFAULT_HANDLERS = build_handlers()
+# Convenience for callers that don't need a real AT client / DB hook (e.g.
+# PR #6 IPC-server tests). Equivalent to ``build_handlers(at_client=MockATClient())``.
+# Kept as a constructor (not a module-level constant) so importing this module
+# in production never spins up a Mock — only test code that explicitly calls
+# ``default_mock_handlers()`` materialises one.
+def default_mock_handlers() -> Mapping[str, Handler]:
+    from isales_telephony.modem_controller.at_client import MockATClient
+
+    return build_handlers(at_client=MockATClient())

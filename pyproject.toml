@@ -125,3 +125,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# impl-real-at: tests/conftest.py opts the ATClient dispatcher into
+# MockATClient mode via ISALES_ALLOW_MOCK_AT=1 at import time. Production
+# deployments MUST NOT set that env var — see
+# modem_controller/main.py:_make_at_client.

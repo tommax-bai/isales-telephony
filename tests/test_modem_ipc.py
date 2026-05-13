@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from isales_telephony.modem_controller.handlers import DEFAULT_HANDLERS
+from isales_telephony.modem_controller.handlers import default_mock_handlers
 from isales_telephony.modem_controller.ipc_server import (
     MAX_FRAME_BYTES,
     IPCServer,
@@ -26,7 +26,7 @@ async def ipc_server() -> AsyncIterator[IPCServer]:
     import uuid
 
     sock_path = Path(tempfile.gettempdir()) / f"is-{uuid.uuid4().hex[:8]}.sock"
-    server = IPCServer(str(sock_path), DEFAULT_HANDLERS)
+    server = IPCServer(str(sock_path), default_mock_handlers())
     await server.start()
     task = asyncio.create_task(_serve_in_background(server))
     import contextlib
