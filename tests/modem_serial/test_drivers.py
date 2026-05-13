@@ -32,7 +32,7 @@ def test_parse_csq_returns_rssi() -> None:
 def test_classify_dial_failure_maps_known_phrases() -> None:
     assert _classify_dial_failure("ATD failed: NO CARRIER") == HANGUP_CAUSE_MAP["NO CARRIER"]
     assert _classify_dial_failure("BUSY") == HANGUP_CAUSE_MAP["BUSY"]
-    assert _classify_dial_failure("totally weird") == "device_error"
+    assert _classify_dial_failure("totally weird") == "network_out_of_order"
 
 
 @pytest.mark.asyncio

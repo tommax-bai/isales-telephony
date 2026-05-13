@@ -162,11 +162,12 @@ async def test_hangup_command_short_circuits_call(
         ack2 = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
         assert ack2 == {"event": "hangup_ack", "session_id": session_id}
 
-        # The dial event stream should now emit remote_hangup with local_clearing
-        # (no connected event since we cancelled before the delay).
+        # The dial event stream should now emit remote_hangup with manual_hangup
+        # (canonical HangupCause; impl-real-at renamed local_clearing → manual_hangup;
+        # no connected event since we cancelled before the delay).
         evt = json.loads(await asyncio.wait_for(reader.readline(), timeout=2))
         assert evt["event"] == "remote_hangup"
-        assert evt["cause"] == "local_clearing"
+        assert evt["cause"] == "manual_hangup"
     finally:
         writer.close()
         with contextlib.suppress(Exception):

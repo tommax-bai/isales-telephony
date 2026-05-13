@@ -23,24 +23,28 @@ logger = structlog.get_logger(__name__)
 
 
 # Spec § GSM hangup_cause 映射 — keyed off the AT response phrase /
-# +CEER cause code that the modem produces. Values match the
-# call-state-machine spec hangup_cause enum.
+# +CEER cause code that the modem produces. Values come from the canonical
+# ``isales_common.enums.HangupCause`` enum (impl-real-at): retry-followup
+# spec § "重试与跟进的概念区分" classifies these into retry / follow-up /
+# do-not-call buckets and worker code expects the string to round-trip
+# through ``HangupCause(...)`` without raising ValueError.
 HANGUP_CAUSE_MAP: dict[str, str] = {
-    "NO CARRIER": "user_hangup",
-    "BUSY": "callee_busy",
-    "NO ANSWER": "callee_no_answer",
-    "NO DIALTONE": "device_error",
+    # URC tokens emitted by A7670 / SIM800C / Quectel UC20 on call termination
+    "NO CARRIER": "user_hangup",  # NO CARRIER after CONNECT = remote ended call
+    "BUSY": "user_busy",
+    "NO ANSWER": "no_answer",
+    "NO DIALTONE": "network_out_of_order",
     # +CEER cause numbers (3GPP TS 24.008 §10.5.4.11 subset):
-    "1": "callee_no_route",  # Unallocated number
-    "16": "user_hangup",  # Normal call clearing
-    "17": "callee_busy",
-    "18": "callee_no_answer",  # No user responding
-    "19": "callee_no_answer",  # User alerting, no answer
-    "27": "device_error",  # Destination out of order
-    "31": "device_error",  # Normal, unspecified
-    "34": "carrier_congestion",  # No circuit/channel available
-    "38": "device_error",  # Network out of order
-    "41": "carrier_congestion",  # Temporary failure
+    "1": "call_rejected",  # Unallocated number — treated as rejection
+    "16": "normal_clearing",  # Normal call clearing
+    "17": "user_busy",
+    "18": "no_answer",  # No user responding
+    "19": "no_answer",  # User alerting, no answer
+    "27": "network_out_of_order",  # Destination out of order
+    "31": "network_out_of_order",  # Normal, unspecified
+    "34": "network_out_of_order",  # No circuit/channel available
+    "38": "network_out_of_order",  # Network out of order
+    "41": "temporary_failure",  # Temporary failure
 }
 
 
@@ -209,4 +213,4 @@ def _classify_dial_failure(message: str) -> str:
     for token, cause in HANGUP_CAUSE_MAP.items():
         if token in upper:
             return cause
-    return "device_error"
+    return "network_out_of_order"
