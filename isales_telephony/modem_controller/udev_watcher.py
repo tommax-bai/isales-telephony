@@ -40,10 +40,10 @@ from .platforms import UdevEvent, UsbDeviceWatcherError, get_usb_watcher_class
 
 logger = logging.getLogger(__name__)
 
-# vendor_id, product_id — case-insensitive 4-char hex. Add real values when
-# stage 6 enumerates the supported modems.
+# vendor_id, product_id — case-insensitive 4-char hex.
 GSM_MODEM_WHITELIST: set[tuple[str, str]] = {
-    ("2c7c", "0125"),  # Quectel EC25 (placeholder; verify in stage 6)
+    ("2c7c", "0125"),  # Quectel EC25
+    ("1a86", "55d3"),  # SIMCom A7670 via WCH CH343 USB-UART bridge
 }
 
 
