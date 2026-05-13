@@ -122,6 +122,19 @@ ignore_missing_imports = true
 module = "sounddevice"
 ignore_missing_imports = true
 
+# grpcio has no first-party type stubs (types-grpcio is community-
+# maintained and lags upstream). Treat the import surface as untyped.
+[[tool.mypy.overrides]]
+module = ["grpc.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Generated gRPC service stubs in isales-common don't carry type
+# annotations on the bridge helpers; skip strict checks at their call
+# sites here (the wire schema lives in cloud_edge.proto + .pyi).
+module = ["isales_common.proto.*"]
+ignore_errors = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
