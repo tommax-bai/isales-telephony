@@ -89,15 +89,66 @@ ISALES_DATABASE_URL=... /opt/isales/venv/bin/alembic -c \
 
 ### Required environment
 
-| variable                  | api  | modem | meaning                                              |
-|---------------------------|------|-------|------------------------------------------------------|
-| `ISALES_DATABASE_URL`     | yes  | yes   | PG asyncpg URL (`postgresql+asyncpg://...`)          |
-| `ISALES_REDIS_URL`        | yes  | -     | Redis URL — currently used by future PRs             |
-| `ISALES_JWT_SECRET`       | yes  | -     | HS256 secret shared with isales-api (signs)          |
-| `ISALES_MODEM_SOCKET`     | -    | opt   | IPC socket path (default `/var/run/isales/modem.sock`) |
-| `ISALES_SKIP_UDEV`        | -    | opt   | `1` to skip udev (dev/macOS only)                    |
-| `MOCK_DIAL_DELAY_MS`      | -    | opt   | mock AT dial→connected delay (default 1000)          |
-| `MOCK_CALL_DURATION_MS`   | -    | opt   | mock connected→remote_hangup delay (default 5000)    |
+| variable                    | api  | modem | meaning                                              |
+|-----------------------------|------|-------|------------------------------------------------------|
+| `ISALES_DATABASE_URL`       | yes  | yes   | PG asyncpg URL (`postgresql+asyncpg://...`)          |
+| `ISALES_REDIS_URL`          | yes  | -     | Redis URL — currently used by future PRs             |
+| `ISALES_JWT_SECRET`         | yes  | -     | HS256 secret shared with isales-api (signs)          |
+| `ISALES_MODEM_SOCKET`       | -    | opt   | IPC socket path (default `/var/run/isales/modem.sock`) |
+| `ISALES_MODEM_SERIAL_PATH`  | -    | **req** in prod | tty path of the GSM modem (e.g. `/dev/ttyUSB-isales-modem`, `/dev/cu.usbmodem21301`); if unset, modem-controller refuses to start unless `ISALES_ALLOW_MOCK_AT=1` |
+| `ISALES_MODEM_DRIVER`       | -    | opt   | driver hint `a7670` / `sim800c` / `quectel_uc20`; empty → auto-detect via `AT+GMI`/`AT+GMM` |
+| `ISALES_ALLOW_MOCK_AT`      | -    | opt   | `1` → fall back to MockATClient when `ISALES_MODEM_SERIAL_PATH` unset; **CI / dev only**, never production |
+| `ISALES_SKIP_UDEV`          | -    | opt   | `1` to skip udev (dev/macOS only)                    |
+| `MOCK_DIAL_DELAY_MS`        | -    | opt   | mock AT dial→connected delay (default 1000)          |
+| `MOCK_CALL_DURATION_MS`     | -    | opt   | mock connected→remote_hangup delay (default 5000)    |
+
+## Real hardware smoke test
+
+`scripts/at_smoke.py` exercises a single dial → connect → hangup cycle
+against a real GSM modem without booting the full IPC server / database.
+Use it after every fresh edge deployment, after replacing a modem, or after
+a release that touches `at_client.py` / `drivers.py` / `serial_protocol.py`.
+
+**Linux:**
+
+```bash
+# Discover the tty (udev rule should create the symlink already)
+ls /dev/ttyUSB-isales-modem /dev/ttyUSB[0-9]
+
+# Dial 13800138000, hold for 5s after connect, then hang up
+.venv/bin/python scripts/at_smoke.py \
+    --tty /dev/ttyUSB-isales-modem --number 13800138000
+```
+
+**macOS:**
+
+```bash
+# Discover the tty after plugging the modem
+ls /dev/cu.usbmodem*
+
+# Dial; supply --driver if auto-detect fails (e.g. SIM800C / Quectel firmware
+# that doesn't answer AT+GMI/AT+GMM cleanly)
+.venv/bin/python scripts/at_smoke.py \
+    --tty /dev/cu.usbmodem21301 --number 13800138000 --driver a7670
+```
+
+Expected output is a chronological event log:
+
+```
+[  0.00s] opening /dev/cu.usbmodem21301 (driver_hint=<auto>)
+[  0.42s] modem ready; calling dial('13800138000')
+[  0.45s] dial accepted; call_id=ab12...; polling for connect
+[  3.12s] EVENT connected call_id=ab12... cause=None
+[  3.12s] connected; sleeping 5.0s then hanging up
+[  8.13s] calling client.hangup(ab12...)
+[  8.18s] EVENT remote_hangup call_id=ab12... cause='local_clearing'
+[  8.18s] DONE connected=True hangup_cause=local_clearing
+```
+
+Exit 0 means the full sequence completed. Non-zero (with traceback) means
+the dial failed before connect, the modem returned an unexpected URC, or
+the tty was already locked by another process (typically a still-running
+modem-controller — stop it first).
 
 ### Network policy
 
