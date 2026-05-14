@@ -135,6 +135,12 @@ ignore_missing_imports = true
 module = ["isales_common.proto.*"]
 ignore_errors = true
 
+# scipy ships partial type stubs only; signal.resample_poly typing is
+# loose. Accept missing imports here.
+[[tool.mypy.overrides]]
+module = ["scipy.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
