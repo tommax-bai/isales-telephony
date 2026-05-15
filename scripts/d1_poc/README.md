@@ -3,6 +3,10 @@
 Spec: `openspec/changes/windows-client-core/tasks.md` § 2, `design.md`
 Decisions 1 + 3, Risks 列表前三条。
 
+> **第一次在一台干净 Windows PC 上跑？** 先看 [WINDOWS_SETUP.md](
+> WINDOWS_SETUP.md) — 那份文档讲怎么装 Python / VS Build Tools /
+> VC++ Redist / 阿里 ARTC SDK 等系统级依赖。本文档假设环境已就位。
+
 ## TL;DR
 
 在一台 Windows 10 21H2+ / Windows 11 PC 上一次性跑完三个脚本，每个输出
