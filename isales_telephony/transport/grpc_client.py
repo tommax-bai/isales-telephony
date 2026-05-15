@@ -10,16 +10,19 @@ ONE bidi stream to the cloud. Auto-reconnect with exponential backoff
 - ``send(msg, critical=True)`` raises :class:`EdgeNotConnected`. Use this
   for ``Heartbeat`` (a stale heartbeat is meaningless) and ``DialAck``
   (the cloud has already moved on if the ACK didn't land).
-- ``send(msg, critical=False)`` queues to a bounded in-memory buffer
-  (FIFO, oldest dropped on overflow). Buffered frames flush in order on
-  reconnect. Use this for ``CallEvent`` and ``HardwareAlert`` — they
-  need durable delivery, but the spec accepts in-flight loss for
-  catastrophic crashes (a persistent SQLite buffer is a follow-up PR).
+- ``send(msg, critical=False)`` queues to a bounded buffer (FIFO, oldest
+  dropped on overflow). Buffered frames flush in order on reconnect.
+  Use this for ``CallEvent`` and ``HardwareAlert`` — they need durable
+  delivery across disconnects.
 
-The implementation deliberately keeps the buffer abstraction narrow:
-the in-memory ``deque`` here is the v1 floor. A future PR swaps it for
-a persistent SQLite-backed buffer (deps.txt change + same ``send``
-contract).
+Two buffer backends are supported:
+
+- **In-memory ``deque``** (default): tests + dev. Lost on process crash.
+- **Durable :class:`SqliteEventBuffer`** (opt-in via ``event_buffer``
+  ctor arg): production. Frames survive process restart per spec §
+  Scenario "断线重连与本地 buffer". The buffer is constructed and
+  ``open()``-ed by the caller (deployment-topology spec § state_dir);
+  this client only appends / iterates / deletes.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import grpc
 import grpc.aio
@@ -41,7 +44,21 @@ from isales_common.transport.cloud_edge import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
+
+
+class DurableEventBuffer(Protocol):
+    """Minimal surface CloudEdgeGrpcClient needs from a durable buffer.
+
+    :class:`isales_telephony.transport.sqlite_buffer.SqliteEventBuffer`
+    is the production implementation; tests can pass any object with
+    these four methods.
+    """
+
+    def append(self, message: pb.Edge2Cloud) -> int: ...
+    def iter_pending(self) -> Iterator[tuple[int, pb.Edge2Cloud]]: ...
+    def delete_through(self, seq: int) -> int: ...
+    def __len__(self) -> int: ...
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +86,7 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
         max_backoff_s: float = 30.0,
         backoff_factor: float = 2.0,
         memory_buffer_limit: int = 10_000,
+        event_buffer: DurableEventBuffer | None = None,
     ) -> None:
         if initial_backoff_s <= 0:
             raise ValueError("initial_backoff_s must be positive")
@@ -96,7 +114,14 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
         # External stop signal.
         self._stop_event = asyncio.Event()
         # Pending buffer for non-critical frames queued while disconnected.
-        self._buffer: deque[pb.Edge2Cloud] = deque(maxlen=memory_buffer_limit)
+        # Exactly one backend is active: durable (sqlite) takes priority
+        # when configured; otherwise the in-memory deque is the floor.
+        self._durable_buffer: DurableEventBuffer | None = event_buffer
+        self._memory_buffer: deque[pb.Edge2Cloud] | None = (
+            None
+            if event_buffer is not None
+            else deque(maxlen=memory_buffer_limit)
+        )
 
         self._connect_task: asyncio.Task[None] | None = None
 
@@ -179,11 +204,16 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
             return
         if critical:
             raise EdgeNotConnected("cloud-edge stream not connected")
-        # FIFO drop-oldest is what deque(maxlen=N) does by default;
-        # callers observe the message *might* be lost on overflow but the
-        # client doesn't raise (overflow under sustained disconnect is a
+        # FIFO drop-oldest: the deque(maxlen=N) backend drops silently;
+        # the sqlite backend evicts the oldest row and logs a warning
+        # from inside SqliteEventBuffer.append. Either way the client
+        # doesn't raise (overflow under sustained disconnect is a
         # symptom upstream should already alert on via heartbeat gaps).
-        self._buffer.append(message)
+        if self._durable_buffer is not None:
+            self._durable_buffer.append(message)
+        else:
+            assert self._memory_buffer is not None
+            self._memory_buffer.append(message)
 
     def on_cloud_message(self, callback: CloudMessageCallback) -> None:
         self._cloud_callback = callback
@@ -200,7 +230,10 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
         Used by callers and tests to surface buffer health; not part of
         the ABC.
         """
-        return len(self._buffer)
+        if self._durable_buffer is not None:
+            return len(self._durable_buffer)
+        assert self._memory_buffer is not None
+        return len(self._memory_buffer)
 
     # ===== Connect loop ==================================================
 
@@ -289,7 +322,21 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
 
     async def _flush_buffer(self) -> None:
         """Move any queued-while-disconnected frames onto the active
-        stream's outbound, in original order."""
-        while self._buffer:
-            msg = self._buffer.popleft()
+        stream's outbound, in original order.
+
+        For the durable backend, weak-ACK each row immediately after
+        ``outbound.put`` returns — the row is gone from the buffer once
+        it's on the wire-bound queue. This matches the v1 semantics
+        documented in :mod:`isales_telephony.transport.sqlite_buffer`:
+        a proto-level ACK is the future path that would let us survive
+        crashes between put and actual transmit.
+        """
+        if self._durable_buffer is not None:
+            for seq, msg in self._durable_buffer.iter_pending():
+                await self._outbound.put(msg)
+                self._durable_buffer.delete_through(seq)
+            return
+        assert self._memory_buffer is not None
+        while self._memory_buffer:
+            msg = self._memory_buffer.popleft()
             await self._outbound.put(msg)

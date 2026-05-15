@@ -29,6 +29,7 @@ from isales_common.proto import cloud_edge_pb2_grpc
 from isales_common.transport.cloud_edge import EdgeNotConnected
 
 from isales_telephony.transport.grpc_client import CloudEdgeGrpcClient
+from isales_telephony.transport.sqlite_buffer import SqliteEventBuffer
 
 
 def _free_port() -> int:
@@ -421,3 +422,167 @@ async def test_callback_exception_does_not_kill_stream(
     finally:
         await client.stop()
         await server.stop(grace=0.1)
+
+
+# --------------------------------------------------------------------------
+# Durable SQLite buffer integration
+#
+# Spec: service-communication § Scenario "断线重连与本地 buffer" — the
+# in-memory deque covers the v1 floor; SqliteEventBuffer covers the
+# spec'd "中断期间产生的 CallEvent / HardwareAlert SHALL 写入边缘本地
+# SQLite buffer". These tests verify the wire-up.
+# --------------------------------------------------------------------------
+
+
+def _open_buffer(tmp_path: object) -> SqliteEventBuffer:
+    """Helper: open a fresh sqlite buffer under tmp_path."""
+    from pathlib import Path
+
+    assert isinstance(tmp_path, Path)
+    buf = SqliteEventBuffer(path=tmp_path / "edge_buffer.db")
+    buf.open()
+    return buf
+
+
+@pytest.mark.asyncio
+async def test_durable_buffer_appends_while_disconnected(tmp_path: object) -> None:
+    """send(critical=False) before start() appends rows to the sqlite
+    buffer instead of the in-memory deque."""
+    buf = _open_buffer(tmp_path)
+    try:
+        client = CloudEdgeGrpcClient(event_buffer=buf)
+        for i in range(3):
+            await client.send(
+                pb.Edge2Cloud(
+                    call_event=pb.CallEvent(
+                        call_id=f"c-{i}",
+                        connected=pb.Connected(),
+                    ),
+                ),
+            )
+        assert client.pending_buffer_size() == 3
+        assert len(buf) == 3
+    finally:
+        buf.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_critical_still_raises_when_disconnected(
+    tmp_path: object,
+) -> None:
+    """The sqlite buffer is for non-critical frames only; critical=True
+    must still raise EdgeNotConnected (Heartbeat / DialAck contract)."""
+    buf = _open_buffer(tmp_path)
+    try:
+        client = CloudEdgeGrpcClient(event_buffer=buf)
+        with pytest.raises(EdgeNotConnected):
+            await client.send(
+                pb.Edge2Cloud(heartbeat=pb.Heartbeat()),
+                critical=True,
+            )
+        assert len(buf) == 0
+    finally:
+        buf.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_buffer_flushes_in_order_on_connect(
+    tmp_path: object,
+) -> None:
+    """Frames appended while disconnected are flushed in seq order on
+    first connect, and deleted from the durable buffer after put."""
+    buf = _open_buffer(tmp_path)
+    try:
+        client = CloudEdgeGrpcClient(
+            initial_backoff_s=0.05,
+            event_buffer=buf,
+        )
+        for i in range(3):
+            await client.send(
+                pb.Edge2Cloud(
+                    call_event=pb.CallEvent(
+                        call_id=f"d-{i}",
+                        connected=pb.Connected(),
+                    ),
+                ),
+            )
+        assert len(buf) == 3
+
+        server, servicer, target = await _start_server()
+        try:
+            await client.start(target, "good-token")
+            for _ in range(100):
+                if len(servicer.received) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            assert [f.call_event.call_id for f in servicer.received] == [
+                "d-0",
+                "d-1",
+                "d-2",
+            ]
+            # Weak-ACK semantics: rows are deleted as they hit the
+            # outbound queue.
+            assert len(buf) == 0
+            assert client.pending_buffer_size() == 0
+        finally:
+            await client.stop()
+            await server.stop(grace=0.1)
+    finally:
+        buf.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_buffer_survives_client_restart(tmp_path: object) -> None:
+    """The whole point of the durable backend: frames appended to one
+    client instance must replay through a fresh instance pointed at the
+    same buffer file (i.e. simulating a process crash + restart)."""
+    from pathlib import Path
+
+    assert isinstance(tmp_path, Path)
+    db_path = tmp_path / "edge_buffer.db"
+
+    # Phase 1: produce, no server up — frames land in sqlite.
+    buf1 = SqliteEventBuffer(path=db_path)
+    buf1.open()
+    try:
+        client1 = CloudEdgeGrpcClient(event_buffer=buf1)
+        for i in range(2):
+            await client1.send(
+                pb.Edge2Cloud(
+                    call_event=pb.CallEvent(
+                        call_id=f"persist-{i}",
+                        connected=pb.Connected(),
+                    ),
+                ),
+            )
+        assert len(buf1) == 2
+    finally:
+        buf1.close()  # close as if process exited
+
+    # Phase 2: a *new* client + buffer instance on the same file; start
+    # against a live server. The pre-existing rows must flush.
+    buf2 = SqliteEventBuffer(path=db_path)
+    buf2.open()
+    try:
+        assert len(buf2) == 2  # rows survived
+        client2 = CloudEdgeGrpcClient(
+            initial_backoff_s=0.05,
+            event_buffer=buf2,
+        )
+        server, servicer, target = await _start_server()
+        try:
+            await client2.start(target, "good-token")
+            for _ in range(100):
+                if len(servicer.received) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert [f.call_event.call_id for f in servicer.received] == [
+                "persist-0",
+                "persist-1",
+            ]
+            assert len(buf2) == 0
+        finally:
+            await client2.stop()
+            await server.stop(grace=0.1)
+    finally:
+        buf2.close()
