@@ -68,6 +68,20 @@ linux = [
 macos = [
     'sounddevice>=0.4.6',
 ]
+# Windows backend extras (windows-client-core D1).
+# - sounddevice: WASAPI capture/playback for the modem audio device
+# - pystray + PySide6 + qasync: tray icon + activation UX + Qt/asyncio
+#   event-loop integration (single-process Python edge client)
+# - pywin32: HKCU Run-key registration + tray notify
+# Markers MUST keep macOS / Linux installs clean — none of these wheels
+# install on non-Windows hosts.
+windows = [
+    'sounddevice>=0.4.6; platform_system == "Windows"',
+    'pystray>=0.19; platform_system == "Windows"',
+    'PySide6>=6.6; platform_system == "Windows"',
+    'qasync>=0.27; platform_system == "Windows"',
+    'pywin32>=306; platform_system == "Windows"',
+]
 
 [project.scripts]
 telephony-api = "isales_telephony.api.main:run"

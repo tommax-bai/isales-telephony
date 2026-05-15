@@ -45,11 +45,15 @@ def get_usb_watcher_class() -> type[UsbDeviceWatcher]:
         from .macos_iokit import MacOSIokitWatcher  # noqa: PLC0415
 
         return MacOSIokitWatcher
+    if sys.platform == "win32":
+        from .windows_serial import WindowsSerialWatcher  # noqa: PLC0415
+
+        return WindowsSerialWatcher
     raise UsbDeviceWatcherError(
         platform=sys.platform,
         message=(
             f"no UsbDeviceWatcher implementation for platform={sys.platform!r}; "
-            "supported: linux, darwin"
+            "supported: linux, darwin, win32"
         ),
     )
 

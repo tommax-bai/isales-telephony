@@ -41,9 +41,30 @@ from .platforms import UdevEvent, UsbDeviceWatcherError, get_usb_watcher_class
 logger = logging.getLogger(__name__)
 
 # vendor_id, product_id — case-insensitive 4-char hex.
+# Extension order: VID:PID pairs that we have actually seen on a bench
+# unit go first; vendor-prefix entries are kept for D1 Windows where
+# operators self-source modems and the PID column is best-effort.
+# windows-client-core task 3.2 — entries below "Windows additions" are
+# new in D1; pre-existing Linux / macOS entries above are untouched.
 GSM_MODEM_WHITELIST: set[tuple[str, str]] = {
+    # ---- pre-existing (Linux + macOS) ----
     ("2c7c", "0125"),  # Quectel EC25
     ("1a86", "55d3"),  # SIMCom A7670 via WCH CH343 USB-UART bridge
+    # ---- Windows additions (D1) ----
+    # Huawei dongles (E353 / E398 / E3372 family — modem class)
+    ("12d1", "1506"),  # Huawei modem mode (multi-PID family)
+    ("12d1", "14db"),  # Huawei E3372 modem mode
+    ("12d1", "1c1e"),  # Huawei modem mode
+    # ZTE MF-series dongles
+    ("19d2", "0117"),  # ZTE MF710 / MF823 modem mode
+    ("19d2", "1405"),  # ZTE MF833 modem mode
+    # SIMCom non-CH343 paths (direct USB CDC ACM)
+    ("1e0e", "9001"),  # SIMCom SIM7600 / SIM7100 series
+    # Quectel additional PIDs (EC21 / EG25-G / RM500Q etc.)
+    ("2c7c", "0121"),  # Quectel EC21
+    ("2c7c", "0306"),  # Quectel EG25-G
+    # u-blox modems (TOBY / SARA series)
+    ("1546", "1146"),  # u-blox TOBY-L2 / SARA-R
 }
 
 

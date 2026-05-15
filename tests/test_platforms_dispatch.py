@@ -41,11 +41,20 @@ def test_dispatch_darwin_returns_macos_class(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_dispatch_unsupported_platform_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
+    # win32 is now supported (windows-client-core D1); pick something
+    # we genuinely don't ship a backend for.
+    monkeypatch.setattr(sys, "platform", "freebsd14")
     with pytest.raises(UsbDeviceWatcherError) as exc_info:
         get_usb_watcher_class()
-    assert exc_info.value.platform == "win32"
-    assert "win32" in str(exc_info.value)
+    assert exc_info.value.platform == "freebsd14"
+    assert "freebsd14" in str(exc_info.value)
+
+
+def test_dispatch_win32_returns_windows_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = get_usb_watcher_class()
+    assert cls.__name__ == "WindowsSerialWatcher"
+    assert issubclass(cls, UsbDeviceWatcher)
 
 
 def test_macos_iokit_instantiation() -> None:
