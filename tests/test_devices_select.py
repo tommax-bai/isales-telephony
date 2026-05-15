@@ -117,6 +117,20 @@ class TestSelectDevice:
             assert dev is not None
             assert dev.status == DeviceStatus.DIALING
 
+    async def test_select_emits_deprecation_header(
+        self, clean_engine: AsyncEngine
+    ) -> None:
+        # arch-cloud-edge-split task 7.7: surface RFC 8594 § 3
+        # `Deprecation` header on any successful /devices/select so
+        # leftover callers in the cloud-edge topology show up in logs.
+        campaign_id = await _seed(clean_engine, n=1)
+        async with _make_internal_client(clean_engine) as client:
+            resp = await client.post(
+                "/devices/select", json={"campaign_id": campaign_id}
+            )
+        assert resp.status_code == 200
+        assert resp.headers.get("deprecation") == "1"
+
     async def test_null_last_call_at_picked_first(
         self, clean_engine: AsyncEngine
     ) -> None:

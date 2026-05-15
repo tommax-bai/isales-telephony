@@ -5,6 +5,15 @@ This route is on an *internal* router (no JWT) because it is called by
 architecture spec, telephony-api SHOULD bind to ``127.0.0.1`` (or an internal
 subnet); the systemd unit and deployment doc enforce that boundary.
 
+**Deprecated (arch-cloud-edge-split task 7.7)**: scheduler no longer
+calls this endpoint in the cloud-edge topology — it queries the cloud-
+side PG directly with the same ``FOR UPDATE SKIP LOCKED`` algorithm
+(see ``isales_scheduler/device_selection.py::pick_idle_device``, task
+6.1). The endpoint stays for boss-console / CLI debugging on the edge,
+and emits a ``Deprecation: 1`` response header per
+RFC 8594 § 3 so any leftover callers surface in logs. Plan to remove
+once C2 multi-tenant work lands.
+
 Algorithm (PR #4 task 4.2): single transaction —
 
   SELECT device.id, sim_card.phone_number
@@ -36,7 +45,7 @@ with a dial; setting status=dialing here makes /select the authoritative
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 from isales_common.enums import DeviceStatus
 from isales_common.models import (
     CampaignDevice,
@@ -56,7 +65,11 @@ router = APIRouter(prefix="/devices", tags=["devices-internal"])
 
 
 @router.post("/select", response_model=DeviceSelectResponse)
-async def select_device(payload: DeviceSelectRequest, session: DBSession) -> DeviceSelectResponse:
+async def select_device(
+    payload: DeviceSelectRequest,
+    session: DBSession,
+    response: Response,
+) -> DeviceSelectResponse:
     stmt = (
         select(Device.id, SimCard.phone_number)
         .join(CampaignDevice, CampaignDevice.device_id == Device.id)
@@ -93,4 +106,9 @@ async def select_device(payload: DeviceSelectRequest, session: DBSession) -> Dev
         .where(Device.id == device_id)
         .values(last_call_at=sql_now(), status=DeviceStatus.DIALING)
     )
+    # RFC 8594 § 3 deprecation signalling. Cloud-edge scheduler does
+    # NOT call this any more — see module docstring. Anyone still
+    # reaching this path (legacy single-host fallback / CLI debug)
+    # will surface the header in their logs.
+    response.headers["Deprecation"] = "1"
     return DeviceSelectResponse(device_id=device_id, phone_number=phone_number)

@@ -1,0 +1,443 @@
+"""EdgeOrchestrator: bridges Cloud2Edge gRPC traffic to AT + AudioBridge.
+
+Spec: arch-cloud-edge-split / service-communication § Requirement: 云-边
+控制面 — "Cloud2Edge.DialCommand → 边缘 AT 拨号 + audio-bridge 入会";
+device-hardware § Requirement: audio-bridge 组件; design.md Decision 2 +
+Decision 5 (engine session co-location, single in-process dispatcher).
+
+One :class:`EdgeOrchestrator` per edge process. Lifecycle of one call:
+
+1. ``Cloud2Edge.DialCommand`` arrives on the gRPC client callback.
+2. The orchestrator constructs a :class:`_CallContext` (RTC session +
+   bridge + ring buffers + capture/playback pumps + AT event pump).
+3. AT ``dial(number)`` returns ``(call_id, event_iterator)``. We emit
+   ``DialAck(accepted=true)`` immediately so the cloud's scheduler can
+   retire its in-flight ``Dial`` timer (DialCommand is at-most-once).
+4. The AT event iterator yields ``connected`` → emit
+   ``CallEvent(connected)``. Audio-bridge join + pumps are started on
+   ``connected``, not on dial, so the RTC channel only spins up for
+   calls that actually go through.
+5. AT yields ``remote_hangup`` (URC or manual hangup) → emit
+   ``CallEvent(remote_hangup)`` with canonical :class:`HangupCause` →
+   tear down audio-bridge + pumps → release the call slot.
+6. ``Cloud2Edge.CancelCommand`` for an active call → call
+   :meth:`ATClient.hangup`; the rest of the teardown happens via the
+   resulting ``remote_hangup`` ATEvent (single termination path).
+
+Concurrency model: a single-modem edge handles ONE call at a time.
+This is enforced by the AT client (``SerialATClient`` raises on
+concurrent dial) but the orchestrator also keeps a ``call_id → context``
+dict so multiple dial commands (e.g. retry after transient grpc error)
+don't trample each other.
+
+Failure modes vs the spec:
+
+- AT dial raises (modem busy / port closed) → emit
+  ``DialAck(accepted=false, reason=...)``. No CallEvent.
+- AT yields ``remote_hangup`` *before* ``connected`` (no_answer / busy)
+  → emit ``CallEvent(remote_hangup)`` without ever joining RTC. This
+  matches the spec's "dial → no_answer never hits the audio path".
+- gRPC client disconnected at the moment we emit a non-critical event
+  → :class:`CloudEdgeClient.send(critical=False)` buffers it; flushed
+  on reconnect. DialAck is sent ``critical=False`` too (the spec says
+  "edge gives up on the cloud, cloud retries on its own"), so a
+  permanently-down stream just buffers ACKs.
+- AT hangup from CancelCommand races with a spontaneous URC hangup →
+  the canceller wins or the URC wins; either way ``_pump_at_events``
+  exits after the first ``remote_hangup`` and tears down once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyped]
+from isales_common.proto import cloud_edge_pb2 as pb
+from isales_common.transport.cloud_edge import CloudEdgeClient
+
+from isales_telephony.audio_bridge.bridge import AudioBridge
+from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
+from isales_telephony.audio_bridge.session import MacosRtcSession
+from isales_telephony.edge.audio_io import run_capture_pump, run_playback_pump
+from isales_telephony.modem_controller.at_client import ATClient, ATEvent
+from isales_telephony.modem_controller.audio_pipe import (
+    CaptureBackend,
+    PlaybackBackend,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Cloud → enum mapping for canonical AT hangup_cause strings (see
+# drivers.HANGUP_CAUSE_MAP). Anything not in here falls back to
+# UNSPECIFIED so the cloud worker can still classify via vendor_raw.
+# `user_hangup` / `manual_hangup` are application-side per
+# isales_common.enums.HangupCause; report as normal_clearing so the
+# cloud worker's retry classifier treats them as non-retryable.
+_HANGUP_CAUSE_TO_PROTO: dict[str, int] = {
+    "no_answer": int(pb.HangupCause.HANGUP_CAUSE_NO_ANSWER),
+    "user_busy": int(pb.HangupCause.HANGUP_CAUSE_USER_BUSY),
+    "network_out_of_order": int(pb.HangupCause.HANGUP_CAUSE_NETWORK_OUT_OF_ORDER),
+    "normal_clearing": int(pb.HangupCause.HANGUP_CAUSE_NORMAL_CLEARING),
+    "call_rejected": int(pb.HangupCause.HANGUP_CAUSE_CALL_REJECTED),
+    "user_hangup": int(pb.HangupCause.HANGUP_CAUSE_NORMAL_CLEARING),
+    "manual_hangup": int(pb.HangupCause.HANGUP_CAUSE_NORMAL_CLEARING),
+}
+
+
+RtcSessionFactory = Callable[[], MacosRtcSession]
+
+
+def _now_ts() -> Timestamp:
+    ts = Timestamp()
+    ts.FromDatetime(datetime.now(tz=UTC))
+    return ts
+
+
+@dataclass
+class _CallContext:
+    """Bookkeeping for one active call. Owned by the orchestrator."""
+
+    call_id: str
+    modem_call_id: str
+    bridge: AudioBridge | None = None
+    upstream: PcmRingBuffer | None = None
+    downstream: PcmRingBuffer | None = None
+    tasks: list[asyncio.Task[None]] = field(default_factory=list)
+
+    async def teardown(self) -> None:
+        """Stop pumps, leave RTC, close ring buffers. Idempotent."""
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        for task in self.tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self.tasks.clear()
+        if self.bridge is not None:
+            with contextlib.suppress(Exception):
+                await self.bridge.leave()
+            self.bridge = None
+        for ring in (self.upstream, self.downstream):
+            if ring is not None and not ring.is_closed:
+                with contextlib.suppress(Exception):
+                    await ring.close()
+        self.upstream = None
+        self.downstream = None
+
+
+class EdgeOrchestrator:
+    """Glue between the cloud-edge gRPC client and the local modem path.
+
+    Args:
+        grpc_client: connected :class:`CloudEdgeClient` — orchestrator
+            registers its message callback during :meth:`start` and
+            sends DialAck / CallEvent / HardwareAlert through this.
+        at_client: :class:`ATClient` for the local modem. Single-modem
+            invariant: only one active call at a time.
+        capture: modem-side PCM capture backend (8 kHz int16 mono).
+            Lifetime ≥ orchestrator lifetime; we open / close it once
+            per process, NOT per call (HW init is slow).
+        playback: modem-side PCM playback backend, same lifetime.
+        rtc_session_factory: produces a fresh :class:`RtcSession` per
+            call. Defaults to :class:`MacosRtcSession` ()-constructor;
+            tests inject paired loopback sessions.
+        ring_capacity_bytes: per-call ring buffer cap. Default 32 KiB
+            (~1 s @ 16 kHz mono int16) — well above the 200 ms spec
+            floor for jitter absorption.
+    """
+
+    def __init__(
+        self,
+        *,
+        grpc_client: CloudEdgeClient,
+        at_client: ATClient,
+        capture: CaptureBackend,
+        playback: PlaybackBackend,
+        rtc_session_factory: RtcSessionFactory | None = None,
+        ring_capacity_bytes: int = 32 * 1024,
+    ) -> None:
+        self._grpc = grpc_client
+        self._at = at_client
+        self._capture = capture
+        self._playback = playback
+        self._rtc_factory: RtcSessionFactory = (
+            rtc_session_factory if rtc_session_factory is not None else MacosRtcSession
+        )
+        self._ring_capacity = ring_capacity_bytes
+        self._calls: dict[str, _CallContext] = {}
+        # Audio capture / playback are HW-scoped, not per-call. The
+        # active call's pumps are wired to the active call's ring
+        # buffers; between calls the pumps drain to a sentinel ring
+        # that is closed (so the pump exits cleanly). Per call we
+        # re-create the pump tasks rather than gating capture on a
+        # "call active?" flag — simpler reasoning, same cost.
+        self._started = False
+
+    # ===== Lifecycle =====================================================
+
+    async def start(self) -> None:
+        """Register the gRPC callback. Must be called after the gRPC
+        client's :meth:`start` returned (i.e. the bidi stream is up or
+        in reconnect)."""
+        if self._started:
+            raise RuntimeError("orchestrator already started")
+        self._grpc.on_cloud_message(self._on_cloud_message)
+        self._started = True
+
+    async def stop(self) -> None:
+        """Tear down all active calls + release HW. Idempotent."""
+        # Snapshot keys: teardown mutates the dict.
+        for call_id in list(self._calls.keys()):
+            ctx = self._calls.pop(call_id, None)
+            if ctx is not None:
+                await ctx.teardown()
+        with contextlib.suppress(Exception):
+            await self._capture.close()
+        with contextlib.suppress(Exception):
+            await self._playback.close()
+        self._started = False
+
+    # ===== gRPC inbound ==================================================
+
+    async def _on_cloud_message(self, msg: pb.Cloud2Edge) -> None:
+        """Dispatch a Cloud2Edge frame to the matching handler.
+
+        Unknown payload kinds are logged and dropped — proto3 lets the
+        cloud add new oneof branches without breaking older edges, so
+        this is by-design forward compat.
+        """
+        kind = msg.WhichOneof("payload")
+        if kind == "dial":
+            await self._on_dial(msg.dial)
+        elif kind == "cancel":
+            await self._on_cancel(msg.cancel)
+        elif kind == "heartbeat":
+            # Cloud-originated heartbeat is liveness-only; the gRPC
+            # client's connect-loop already counts it for reconnect
+            # backoff resets. No orchestrator action.
+            return
+        elif kind in {"config_update", "rtc_credentials", "remote_diag"}:
+            logger.info("cloud2edge_ignored_in_a2", extra={"kind": kind})
+        else:
+            logger.warning("cloud2edge_unknown_kind", extra={"kind": kind})
+
+    # ===== Dial flow =====================================================
+
+    async def _on_dial(self, dial: pb.DialCommand) -> None:
+        call_id = dial.call_id
+        if call_id in self._calls:
+            # Idempotent: cloud may have retried because DialAck got
+            # dropped. ACK again so the cloud's retry timer retires.
+            logger.info(
+                "dial_command_duplicate", extra={"call_id": call_id}
+            )
+            await self._send_dial_ack(call_id, accepted=True, reason="duplicate")
+            return
+
+        try:
+            modem_call_id, at_events = await self._at.dial(dial.number)
+        except Exception as exc:  # noqa: BLE001 — surface as ACK failure
+            logger.exception(
+                "at_dial_failed",
+                extra={"call_id": call_id, "number_len": len(dial.number)},
+            )
+            await self._send_dial_ack(
+                call_id, accepted=False, reason=f"at_dial: {exc.__class__.__name__}"
+            )
+            return
+
+        ctx = _CallContext(call_id=call_id, modem_call_id=modem_call_id)
+        self._calls[call_id] = ctx
+        await self._send_dial_ack(call_id, accepted=True, reason="")
+
+        # The AT event pump owns RTC bring-up (on connected) and the
+        # CallEvent emission for the rest of the call's lifetime.
+        ctx.tasks.append(
+            asyncio.create_task(
+                self._pump_at_events(dial, ctx, at_events),
+                name=f"at_event_pump_{call_id}",
+            )
+        )
+
+    async def _pump_at_events(
+        self,
+        dial: pb.DialCommand,
+        ctx: _CallContext,
+        events: AsyncIterator[ATEvent],
+    ) -> None:
+        try:
+            async for ev in events:
+                if ev.event == "connected":
+                    await self._handle_connected(dial, ctx)
+                elif ev.event == "remote_hangup":
+                    await self._handle_remote_hangup(ctx, ev.cause)
+                    return
+                else:
+                    logger.debug(
+                        "at_event_other",
+                        extra={"call_id": ctx.call_id, "event": ev.event},
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "at_event_pump_unexpected_error",
+                extra={"call_id": ctx.call_id},
+            )
+        finally:
+            # If we exited without seeing remote_hangup (e.g. stream
+            # ended after connected without a hangup URC), still tear
+            # down so we don't leak the RTC session.
+            if ctx.call_id in self._calls:
+                self._calls.pop(ctx.call_id, None)
+                await ctx.teardown()
+
+    async def _handle_connected(
+        self,
+        dial: pb.DialCommand,
+        ctx: _CallContext,
+    ) -> None:
+        # 1. CallEvent(connected) — emit before RTC join so the cloud's
+        #    state machine sees "connected" right when AT says so, even
+        #    if RTC bring-up needs a few hundred ms.
+        await self._send_call_event_connected(ctx.call_id)
+
+        # 2. Build per-call audio path.
+        upstream = PcmRingBuffer(
+            capacity_bytes=self._ring_capacity,
+            name=f"modem_upstream_{ctx.call_id}",
+        )
+        downstream = PcmRingBuffer(
+            capacity_bytes=self._ring_capacity,
+            name=f"modem_downstream_{ctx.call_id}",
+        )
+        bridge = AudioBridge(
+            rtc_session=self._rtc_factory(),
+            modem_upstream=upstream,
+            modem_downstream=downstream,
+            peer_uid=dial.rtc_uid_engine,
+        )
+        ctx.upstream = upstream
+        ctx.downstream = downstream
+        ctx.bridge = bridge
+
+        # 3. Start RTC + pumps. Capture pump runs for the lifetime of
+        #    the call; the orchestrator's single capture / playback
+        #    backends are bound to this call's rings.
+        try:
+            await bridge.join(
+                channel=dial.rtc_channel,
+                token=dial.rtc_token,
+                uid=dial.rtc_uid_edge,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "audio_bridge_join_failed", extra={"call_id": ctx.call_id}
+            )
+            # Treat as a hangup so the cloud knows the call is dead.
+            await self._handle_remote_hangup(ctx, cause="network_out_of_order")
+            return
+
+        ctx.tasks.append(
+            asyncio.create_task(
+                run_capture_pump(self._capture, upstream),
+                name=f"capture_pump_{ctx.call_id}",
+            )
+        )
+        ctx.tasks.append(
+            asyncio.create_task(
+                run_playback_pump(downstream, self._playback),
+                name=f"playback_pump_{ctx.call_id}",
+            )
+        )
+
+    async def _handle_remote_hangup(
+        self, ctx: _CallContext, cause: str | None
+    ) -> None:
+        await self._send_call_event_remote_hangup(ctx.call_id, cause)
+        # Pop before teardown so duplicate events from cancel/at race
+        # don't observe a half-torn context.
+        self._calls.pop(ctx.call_id, None)
+        await ctx.teardown()
+
+    # ===== Cancel flow ===================================================
+
+    async def _on_cancel(self, cancel: pb.CancelCommand) -> None:
+        ctx = self._calls.get(cancel.call_id)
+        if ctx is None:
+            # Idempotent: call already ended, or never existed. Spec
+            # says cloud accepts loss of CancelCommand — silently ignore.
+            logger.info(
+                "cancel_command_no_active_call",
+                extra={"call_id": cancel.call_id},
+            )
+            return
+        try:
+            await self._at.hangup(ctx.modem_call_id)
+        except Exception:  # noqa: BLE001 — AT hangup failure must not
+            # block teardown; the URC pump still gets remote_hangup or
+            # the next process restart sweeps the AT layer.
+            logger.exception(
+                "at_hangup_failed", extra={"call_id": cancel.call_id}
+            )
+
+    # ===== Edge → Cloud emitters =========================================
+
+    async def _send_dial_ack(
+        self, call_id: str, *, accepted: bool, reason: str
+    ) -> None:
+        msg = pb.Edge2Cloud(
+            dial_ack=pb.DialAck(
+                call_id=call_id,
+                accepted=accepted,
+                reason=reason,
+                ts=_now_ts(),
+            )
+        )
+        # DialAck is non-critical: if the cloud doesn't get it within
+        # its retry window it will redial; the duplicate-detection
+        # branch in _on_dial covers that.
+        await self._grpc.send(msg, critical=False)
+
+    async def _send_call_event_connected(self, call_id: str) -> None:
+        msg = pb.Edge2Cloud(
+            call_event=pb.CallEvent(
+                call_id=call_id,
+                ts=_now_ts(),
+                connected=pb.Connected(),
+            )
+        )
+        await self._grpc.send(msg, critical=False)
+
+    async def _send_call_event_remote_hangup(
+        self, call_id: str, cause: str | None
+    ) -> None:
+        hc_int = _HANGUP_CAUSE_TO_PROTO.get(
+            cause or "", int(pb.HangupCause.HANGUP_CAUSE_UNSPECIFIED)
+        )
+        msg = pb.Edge2Cloud(
+            call_event=pb.CallEvent(
+                call_id=call_id,
+                ts=_now_ts(),
+                remote_hangup=pb.RemoteHangup(
+                    cause=pb.HangupCause.ValueType(hc_int),
+                    vendor_raw=cause or "",
+                ),
+            )
+        )
+        await self._grpc.send(msg, critical=False)
+
+    # ===== Introspection (test hooks) ====================================
+
+    @property
+    def active_call_ids(self) -> tuple[str, ...]:
+        return tuple(self._calls.keys())
+
+
+__all__ = ["EdgeOrchestrator"]

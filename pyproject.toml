@@ -72,6 +72,11 @@ macos = [
 [project.scripts]
 telephony-api = "isales_telephony.api.main:run"
 modem-controller = "isales_telephony.modem_controller.main:run"
+# arch-cloud-edge-split task 7.1: unified edge daemon (modem-controller +
+# audio-bridge + cloud-edge gRPC client in one asyncio process).
+# The `modem-controller` entry point above remains for back-compat / debug;
+# production launchd uses `isales-telephony-edge`.
+isales-telephony-edge = "isales_telephony.edge.main:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["isales_telephony"]
