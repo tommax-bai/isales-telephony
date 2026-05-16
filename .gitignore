@@ -21,3 +21,11 @@ ENV/
 
 *.sock
 /var/run/isales/
+
+# Aliyun ARTC SDK for Windows — proprietary binaries / headers; drop the
+# unpacked SDK under deploy/edge/windows/vendor/aliyun-artc-windows/ but
+# never commit it. The PyInstaller spec globs DLLs from this path at
+# build time; absence yields a smoke-test binary that fails at RTC join.
+deploy/edge/windows/vendor/aliyun-artc-windows/include/
+deploy/edge/windows/vendor/aliyun-artc-windows/x64/
+deploy/edge/windows/vendor/aliyun-artc-windows/x86/
