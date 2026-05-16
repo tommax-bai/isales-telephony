@@ -54,3 +54,35 @@ jobs:
 
       - name: Pytest
         run: pytest -v
+
+  windows-tests:
+    # Windows-only unit coverage for the windows-client-core (D1) backend:
+    # WASAPI audio (mocked sounddevice), tray controller helpers, env
+    # writer, activation flow, state bus. The full main_windows.py qasync
+    # path is exercised by hand on a real Windows PC during D1 PoC week 1
+    # (windows-client-core tasks 9.1 / 9.2); CI only covers the
+    # cross-platform-testable surface so Windows-specific regressions
+    # land on PR review, not on the operator's machine.
+    runs-on: windows-latest
+    needs: lint-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install isales-common (v0.1.2 git tag)
+        run: pip install "isales-common @ git+https://github.com/tommax-bai/isales-common@v0.1.2"
+
+      - name: Install with Windows extras
+        run: pip install -e ".[dev,windows]"
+
+      - name: Pytest (windows suite)
+        # The Windows test dir is a self-contained subset; running the
+        # full suite on Windows currently trips on POSIX-only deps
+        # (fcntl in at_client.py — tracked as a follow-up PR per
+        # windows-client-core tasks.md § 3 trailing note).
+        run: pytest -v tests/windows tests/test_platforms_dispatch.py tests/modem_audio

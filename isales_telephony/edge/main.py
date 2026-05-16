@@ -87,6 +87,13 @@ def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
         )
 
         return LinuxAlsaCapture(), LinuxAlsaPlayback()
+    if backend == "windows":  # pragma: no cover — Windows-only path
+        from isales_telephony.modem_controller.audio.windows_wasapi import (
+            WindowsWASAPICapture,
+            WindowsWASAPIPlayback,
+        )
+
+        return WindowsWASAPICapture(), WindowsWASAPIPlayback()
     raise RuntimeError(f"unknown ISALES_EDGE_AUDIO_BACKEND={backend!r}")
 
 
