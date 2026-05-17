@@ -1,0 +1,30 @@
+Microsoft Visual C++ Runtime Redistributable Files
+====================================================
+
+This iSales Windows edge client bundles the following Microsoft Visual C++
+Runtime DLLs as redistributable components:
+
+  - msvcp140.dll
+  - vcruntime140.dll
+  - vcruntime140_1.dll
+
+These files are part of Microsoft Visual C++ 2015-2022 Redistributable
+and are included as permitted by the Microsoft Visual Studio
+Redistributable License Terms.
+
+The full license terms for the Microsoft Visual C++ Redistributable are
+available from Microsoft at:
+
+  https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistributable-files
+
+Specifically the "Distributable Code" section grants the right to:
+  "Distributable Code. You may copy and distribute the object code form
+   of code listed [as the Visual C++ Redistributable Files] (Distributable
+   Code) in programs you develop."
+
+Distribution is subject to the Microsoft Software License Terms of the
+relevant Visual Studio edition. iSales developers must ensure their
+Visual Studio licensing entitles them to redistribute these files.
+
+If you are an iSales operator and have questions about this attribution,
+contact the iSales engineering team.

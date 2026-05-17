@@ -1,0 +1,16 @@
+*.pyd
+*.dll
+*.exp
+*.obj
+*.pdb
+build/
+Release/
+Debug/
+out/
+__pycache__/
+*.egg-info/
+.vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile

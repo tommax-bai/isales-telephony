@@ -31,10 +31,10 @@ from PyInstaller.utils.hooks import collect_submodules
 block_cipher = None
 
 # ARTC SDK Windows native — operator-supplied. Glob over the vendor dir
-# so we don't have to enumerate individual filenames; PyInstaller will
-# silently no-op the glob if the dir is empty (CI builds without ARTC
-# will produce a smoke-test binary that fails at RTC join — acceptable
-# for `make build` smoke).
+# (recursively, since v7.6.0 puts DLLs under x64/Release/) and also pick
+# up the project-local pybind11 binding .pyd from pybind/. PyInstaller
+# silently no-ops missing globs, so CI builds without ARTC still produce
+# a smoke-test binary that fails at RTC import — acceptable.
 artc_binaries = []
 import glob
 import os
@@ -42,12 +42,26 @@ import os
 _HERE = os.path.dirname(os.path.abspath(SPEC))
 _VENDOR_DIR = os.path.join(_HERE, "vendor", "aliyun-artc-windows")
 if os.path.isdir(_VENDOR_DIR):
-    for dll in glob.glob(os.path.join(_VENDOR_DIR, "*.dll")):
+    for dll in glob.glob(os.path.join(_VENDOR_DIR, "**", "*.dll"), recursive=True):
         # (source, destination) — pack into the runtime root so
         # ctypes.CDLL(name) finds it without explicit PATH magic.
         artc_binaries.append((dll, "."))
-    for pyd in glob.glob(os.path.join(_VENDOR_DIR, "*.pyd")):
+
+# Project-local pybind11 binding — built by build.ps1's CMake step.
+# See openspec/changes/windows-artc-pybind11/.
+_PYBIND_DIR = os.path.join(_HERE, "pybind", "aliyun_artc_pywrap")
+if os.path.isdir(_PYBIND_DIR):
+    for pyd in glob.glob(os.path.join(_PYBIND_DIR, "*.pyd")):
         artc_binaries.append((pyd, "."))
+
+# VC Runtime — Aliyun's DLLs + the pybind11 binding both depend on
+# msvcp140 / vcruntime140; bundle them so users don't need VC Redist.
+# See openspec/changes/windows-artc-pybind11/design.md Decision 8.
+_SYS32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+for vcrt_dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+    _src = os.path.join(_SYS32, vcrt_dll)
+    if os.path.exists(_src):
+        artc_binaries.append((_src, "."))
 
 _ICON_DIR = os.path.join(_HERE, "icons")
 _TRAY_ICO = os.path.join(_ICON_DIR, "tray.ico") if os.path.exists(
@@ -63,6 +77,8 @@ a = Analysis(
         (_ICON_DIR, "icons"),
         # env.example.txt ships at the binary root for first-time setup.
         (os.path.join(_HERE, "env.example.txt"), "."),
+        # VC Runtime redistribution attribution (Microsoft EULA terms).
+        (os.path.join(_HERE, "licenses"), "licenses"),
     ],
     hiddenimports=[
         # PySide6 / qasync occasionally miss the submodule scan.
@@ -77,10 +93,11 @@ a = Analysis(
         # sounddevice / cffi: PortAudio wrapper.
         "sounddevice",
         "_cffi_backend",
-        # ARTC SDK Python wrapper — name varies by vendor packaging; add
-        # the canonical one. If the operator's bundle uses a different
-        # module name they edit this list at build time.
-        "aliyun_artc",
+        # Project-local pybind11 binding for the ARTC Windows SDK. The
+        # .pyd ships via `binaries` glob; this hidden import ensures
+        # PyInstaller's depscan treats it as a module reference.
+        # See openspec/changes/windows-artc-pybind11/.
+        "aliyun_artc_pywrap",
         # grpcio runtime helpers PyInstaller sometimes misses.
         *collect_submodules("grpc"),
     ],

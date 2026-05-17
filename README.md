@@ -163,3 +163,30 @@ which is the only signing authority for JWT.
 journalctl -fu isales-telephony-api
 journalctl -fu isales-modem-controller
 ```
+
+## Windows edge client build
+
+The Windows edge client (D1 `windows-client-core`) ships as a PyInstaller
+frozen exe with a tray + activation UI. Build it from a Windows PC with
+Visual Studio Build Tools 2022 (C++ workload) and CMake 3.20+ installed:
+
+```powershell
+# From the isales-telephony repo root, on Windows.
+
+# First-time: check out the pybind11 submodule used by aliyun_artc_pywrap.
+git submodule update --init --recursive
+
+# Drop the Aliyun ARTC SDK for Windows v7.6.0 zip into
+# deploy/edge/windows/vendor/aliyun-artc-windows/ before building.
+# See vendor/README.md for the download URL.
+
+powershell -ExecutionPolicy Bypass -File deploy\edge\windows\build.ps1
+```
+
+Outputs `dist/isales-telephony/` (onedir form) and a timestamped zip.
+`build.ps1` runs CMake to produce the `aliyun_artc_pywrap.pyd` pybind11
+binding (see `deploy/edge/windows/pybind/aliyun_artc_pywrap/README.md`
+and `openspec/changes/windows-artc-pybind11/`) before PyInstaller
+packages everything together. Without the vendor SDK present the CMake
+step is skipped — the resulting exe is a smoke-test binary that will
+fail at `import aliyun_artc_pywrap`.

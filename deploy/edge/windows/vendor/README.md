@@ -48,20 +48,27 @@ see `isales-engine/transport/_rtc_sdk.py`), the **Windows** SDK is
 client therefore needs a project-local pybind11 binding to call into
 the RTC engine.
 
-That binding lives (or will live, depending on which OpenSpec change
-is active) under
+That binding lives under
 `deploy/edge/windows/pybind/aliyun_artc_pywrap/` and produces
 `aliyun_artc_pywrap.pyd` — packaged into the PyInstaller frozen exe
 alongside the ARTC DLLs.
 
-See `openspec/changes/windows-artc-pybind11/` (proposal, pending) and
-the `reference-artc-sdk` memory note for the rationale and the
-estimated 1-week effort.
+**Implementation status (2026-05-17)**: implemented. The binding sources
+`bindings.cpp` / `audio_observer.{h,cpp}` / `engine_listener.{h,cpp}` /
+`ring_buffer.{h,cpp}` live in `pybind/aliyun_artc_pywrap/src/`. CMake
+build is wired into `deploy/edge/windows/build.ps1` before PyInstaller
+runs. The OpenSpec change `openspec/changes/windows-artc-pybind11/`
+captures the design (pybind11 + CMake / GIL strategy / lifecycle).
+See also the `reference-artc-sdk` memory note for the Linux-vs-Windows
+SDK shape discrepancy that originally drove this work.
 
 ## What `build.ps1` expects to find here
 
 The PyInstaller spec (`deploy/edge/windows/isales-telephony.spec`)
-globs `*.dll` and `*.pyd` from `vendor/aliyun-artc-windows/`. If this
-directory is empty the build succeeds but the resulting exe will fail
-at RTC join (a smoke-test outcome — useful for catching wire-up bugs
-without the SDK in CI).
+globs `**/*.dll` recursively from `vendor/aliyun-artc-windows/` (the
+v7.6.0 zip puts them under `x64/Release/`) and globs `*.pyd` from
+`pybind/aliyun_artc_pywrap/` (the CMake build output, see build.ps1
+step 4). If `vendor/` is empty the build still succeeds, but
+`build.ps1` skips the CMake step and the resulting frozen exe will
+fail at `import aliyun_artc_pywrap` — useful for catching wire-up
+bugs without needing the SDK in CI.

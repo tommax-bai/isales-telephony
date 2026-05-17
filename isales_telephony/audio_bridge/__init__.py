@@ -33,6 +33,11 @@ both down. Multiple concurrent calls = multiple bridge instances.
 
 from __future__ import annotations
 
+from __future__ import annotations
+
+import sys
+from typing import TYPE_CHECKING
+
 from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.resampler import Resampler
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
@@ -41,10 +46,36 @@ from isales_telephony.audio_bridge.session import (
     MacosRtcSessionConfig,
 )
 
+if TYPE_CHECKING:
+    from isales_common.audio.rtc import RtcSession
+
+
+def get_default_rtc_session_class() -> type["RtcSession"]:
+    """Return the platform-appropriate :class:`RtcSession` implementation.
+
+    - ``win32`` → :class:`WindowsRtcSession` (real ARTC via pybind11).
+    - ``darwin`` → :class:`MacosRtcSession` (mock loopback; A2 QA path).
+    - other → ``NotImplementedError``.
+
+    The Windows binding (``aliyun_artc_pywrap``) is imported lazily so the
+    rest of the package keeps importing cleanly on macOS / Linux for tests.
+    """
+    if sys.platform == "win32":
+        from isales_telephony.audio_bridge.windows_rtc_session import WindowsRtcSession
+        return WindowsRtcSession
+    if sys.platform == "darwin":
+        return MacosRtcSession
+    raise NotImplementedError(
+        f"No edge RtcSession implementation for platform {sys.platform!r}. "
+        "macOS走 mock，Windows 走 pybind11 binding；Linux 边缘形态不支持 (v1.0)。"
+    )
+
+
 __all__ = [
     "AudioBridge",
     "MacosRtcSession",
     "MacosRtcSessionConfig",
     "PcmRingBuffer",
     "Resampler",
+    "get_default_rtc_session_class",
 ]
