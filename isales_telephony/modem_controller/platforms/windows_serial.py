@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,17 @@ from .base import UdevEvent, UsbDeviceWatcher, UsbDeviceWatcherError
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from serial.tools.list_ports_common import ListPortInfo
+
+
+logger = logging.getLogger(__name__)
+
+
+# Substring (case-insensitive) used to recognise the sibling audio COM
+# port on a SIMCom-class composite USB modem. The SIM7600G-H exposes
+# its MI_04 PCM interface with a description like ``"Simcom HS-USB Audio
+# 9001 (COM11)"`` — the bare ``"Audio"`` token discriminates from the
+# AT / NMEA / Diagnostics / Modem siblings in the same composite.
+AUDIO_DESCRIPTION_TOKEN = "audio"
 
 
 # 1 Hz scan cadence — see latency analysis in module docstring.
@@ -238,4 +250,77 @@ class WindowsSerialWatcher(UsbDeviceWatcher):
         self._task = None
 
 
-__all__ = ["WindowsSerialWatcher"]
+def find_audio_serial_path(
+    *,
+    usb_serial: str | None,
+    vid: str | None,
+    pid: str | None,
+    scanner: Callable[[], Iterable["ListPortInfo"]] | None = None,
+) -> str | None:
+    """Locate the sibling audio COM port for a USB composite GSM modem.
+
+    Walks the current ``serial.tools.list_ports.comports()`` enumeration
+    and returns the device path (e.g. ``"COM11"``) of the sibling port
+    that:
+
+    1. has the same USB ``vid`` / ``pid`` as the AT channel,
+    2. has the same USB composite ``serial_number`` (i.e. is part of
+       the same physical device — Windows assigns one ``iSerialNumber``
+       across all interfaces of a composite USB device), AND
+    3. has the substring :data:`AUDIO_DESCRIPTION_TOKEN` (case-insensitive)
+       in its pyserial ``description``.
+
+    Returns ``None`` if no sibling matches, or if the scan itself raises.
+    The caller (audio backend constructor) treats ``None`` as "audio
+    backend not constructible for this modem — surface via the usual
+    init-failure HardwareAlert path".
+
+    Args:
+        usb_serial: USB composite ``serial_number``. ``None`` short-
+            circuits to ``None`` (without a serial we cannot disambiguate
+            siblings on a host with multiple modems plugged in).
+        vid: Lowercase 4-hex VID of the AT channel.
+        pid: Lowercase 4-hex PID of the AT channel.
+        scanner: Test hook — supply an iterable of ``ListPortInfo``-shaped
+            objects (with ``device`` / ``vid`` / ``pid`` / ``serial_number``
+            / ``description`` attributes). Defaults to
+            ``serial.tools.list_ports.comports``.
+    """
+    if not usb_serial:
+        return None
+
+    if scanner is None:
+        try:
+            from serial.tools.list_ports import comports  # noqa: PLC0415
+
+            scanner = comports
+        except ImportError:  # pragma: no cover — pyserial in main deps
+            return None
+
+    try:
+        ports = list(scanner())
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception("find_audio_serial_path: pyserial scan failed")
+        return None
+
+    token = AUDIO_DESCRIPTION_TOKEN.lower()
+    for port in ports:
+        port_vid = _vid_pid_hex(getattr(port, "vid", None))
+        port_pid = _vid_pid_hex(getattr(port, "pid", None))
+        port_serial = getattr(port, "serial_number", None)
+        port_desc = getattr(port, "description", None) or ""
+        if port_vid != vid or port_pid != pid:
+            continue
+        if port_serial != usb_serial:
+            continue
+        if token not in port_desc.lower():
+            continue
+        return str(port.device)
+    return None
+
+
+__all__ = [
+    "AUDIO_DESCRIPTION_TOKEN",
+    "WindowsSerialWatcher",
+    "find_audio_serial_path",
+]

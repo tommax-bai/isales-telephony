@@ -43,6 +43,26 @@ class ATEvent:
     cause: str | None = None
 
 
+class PcmEnableError(RuntimeError):
+    """Raised when ``AT+CPCMREG=1`` did not return ``OK``.
+
+    SIMCom-class modems gate the audio COM port byte stream behind an
+    AT-side switch (``AT+CPCMREG=1`` per the SIMCom application manual).
+    The command only succeeds while a call is connected; outside of a
+    call the modem responds ``ERROR`` because the audio DSP is not
+    holding a PCM context.
+
+    The orchestrator catches this in
+    :meth:`EdgeOrchestrator._handle_connected` and converts to a
+    ``HardwareAlert`` + remote hangup so the cloud retire-retry path
+    treats the call as a hardware failure rather than a no-answer.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail or "AT+CPCMREG=1 did not return OK")
+        self.detail = detail
+
+
 class ATClient(Protocol):
     async def dial(self, number: str) -> tuple[str, AsyncIterator[ATEvent]]:
         ...
@@ -57,6 +77,27 @@ class ATClient(Protocol):
         ...
 
     async def get_imei(self) -> str:
+        ...
+
+    async def cpcmreg_enable(self) -> None:
+        """Enable the SerialPcm byte stream on a SIMCom audio COM port.
+
+        Wraps ``AT+CPCMREG=1``. SHALL raise :class:`PcmEnableError` if
+        the modem returns ``ERROR`` / times out, so the orchestrator
+        can convert to a HardwareAlert and tear down the call. Called
+        per-call between ``connected`` and ``audio_bridge.join_rtc``.
+        Drivers for modems with a different PCM enable protocol MAY
+        override.
+        """
+        ...
+
+    async def cpcmreg_disable(self) -> None:
+        """Disable the SerialPcm byte stream.
+
+        Wraps ``AT+CPCMREG=0``. Failure is logged but MUST NOT raise —
+        teardown is the only caller and a failed CPCMREG=0 is recoverable
+        on the next CPCMREG=1.
+        """
         ...
 
 
@@ -120,6 +161,13 @@ class MockATClient:
     async def get_imei(self) -> str:
         return "0" * 15
 
+    async def cpcmreg_enable(self) -> None:
+        # Mock has no audio plane; pretend the modem ACKed.
+        return
+
+    async def cpcmreg_disable(self) -> None:
+        return
+
 
 async def _wait_or_cancelled(seconds: float, canceller: asyncio.Event) -> bool:
     """Sleep ``seconds`` or until cancelled; return True if slept fully."""
@@ -135,6 +183,7 @@ __all__ = [
     "ATEvent",
     "BusyDeviceError",
     "MockATClient",
+    "PcmEnableError",
     "SerialATClient",
 ]
 
@@ -313,6 +362,35 @@ class SerialATClient:
 
     async def get_imei(self) -> str:
         return await self._driver.imei()
+
+    async def cpcmreg_enable(self) -> None:
+        """``AT+CPCMREG=1`` — open the audio COM PCM byte stream.
+
+        Raises :class:`PcmEnableError` on ERROR / timeout so the
+        orchestrator can convert to ``HardwareAlert.ModemInitFailed``
+        (stage=``"CPCMREG_ENABLE"``) and hang up the call.
+        """
+        from isales_telephony.modem_controller.serial_protocol import AtError
+
+        try:
+            await self._at.send("AT+CPCMREG=1", timeout=2.0)
+        except AtError as exc:
+            raise PcmEnableError(detail=str(exc)) from exc
+
+    async def cpcmreg_disable(self) -> None:
+        """``AT+CPCMREG=0`` — close the audio COM PCM byte stream.
+
+        Best-effort: log on failure but do NOT raise. Teardown calls
+        this after ``audio_bridge.leave`` so failing here just leaves
+        the modem in a slightly stale audio-DSP state that the next
+        ``cpcmreg_enable`` will reset.
+        """
+        from isales_telephony.modem_controller.serial_protocol import AtError
+
+        try:
+            await self._at.send("AT+CPCMREG=0", timeout=2.0)
+        except AtError as exc:
+            logger.warning("cpcmreg_disable failed: %s", exc)
 
     async def aclose(self) -> None:
         """Release the URC queue, close AtClient, release flock."""

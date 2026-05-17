@@ -59,9 +59,9 @@ def get_capture_class() -> type[CaptureBackend]:
 
         return MacOSCoreAudioCapture
     if sys.platform == "win32":
-        from .windows_wasapi import WindowsWASAPICapture  # noqa: PLC0415
+        from .windows_serial_pcm import WindowsSerialPcmCapture  # noqa: PLC0415
 
-        return WindowsWASAPICapture
+        return WindowsSerialPcmCapture
     raise AudioBackendError(
         platform=sys.platform,
         message=f"no capture backend for platform={sys.platform!r}",
@@ -78,9 +78,9 @@ def get_playback_class() -> type[PlaybackBackend]:
 
         return MacOSCoreAudioPlayback
     if sys.platform == "win32":
-        from .windows_wasapi import WindowsWASAPIPlayback  # noqa: PLC0415
+        from .windows_serial_pcm import WindowsSerialPcmPlayback  # noqa: PLC0415
 
-        return WindowsWASAPIPlayback
+        return WindowsSerialPcmPlayback
     raise AudioBackendError(
         platform=sys.platform,
         message=f"no playback backend for platform={sys.platform!r}",

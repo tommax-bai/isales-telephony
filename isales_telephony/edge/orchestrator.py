@@ -64,11 +64,22 @@ from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
 from isales_telephony.audio_bridge.session import MacosRtcSession
 from isales_telephony.edge.audio_io import run_capture_pump, run_playback_pump
-from isales_telephony.modem_controller.at_client import ATClient, ATEvent
+from isales_telephony.modem_controller.at_client import (
+    ATClient,
+    ATEvent,
+    PcmEnableError,
+)
 from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
     PlaybackBackend,
 )
+
+
+# AT command stage label for the HardwareAlert emitted when AT+CPCMREG=1
+# fails on call connect. Spec § "PCM 通道按 SIMCom AT 协议启停 (CPCMREG)"
+# requires a HardwareAlert; we reuse the existing ``ModemInitFailed`` oneof
+# kind (no proto bump required) and carry the failure-point in ``stage``.
+PCM_ENABLE_FAILED_STAGE = "CPCMREG_ENABLE"
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +116,32 @@ class _CallContext:
 
     call_id: str
     modem_call_id: str
+    at_client: ATClient | None = None
     bridge: AudioBridge | None = None
     upstream: PcmRingBuffer | None = None
     downstream: PcmRingBuffer | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    # True iff AT+CPCMREG=1 succeeded for this call and AT+CPCMREG=0 has
+    # not been sent yet. Gates teardown's cpcmreg_disable so we don't
+    # spam ERRORs on calls that never reached connected.
+    cpcmreg_enabled: bool = False
+    # True after _handle_remote_hangup has emitted the CallEvent. Used
+    # to dedupe when the cpcmreg-enable failure path hangs up first
+    # (sending CallEvent + initiating modem hangup) and the AT event
+    # pump then sees the resulting manual_hangup URC.
+    terminated: bool = False
 
     async def teardown(self) -> None:
-        """Stop pumps, leave RTC, close ring buffers. Idempotent."""
+        """Stop pumps, leave RTC, send CPCMREG=0, close ring buffers.
+
+        Spec § "PCM 通道按 SIMCom AT 协议启停 (CPCMREG)" requires
+        ``AT+CPCMREG=0`` after ``audio_bridge.leave_rtc()`` so the modem
+        releases its audio DSP state. Disable failure is logged inside
+        :meth:`SerialATClient.cpcmreg_disable` (warning only) — teardown
+        must complete regardless.
+
+        Idempotent: safe to call multiple times.
+        """
         for task in self.tasks:
             if not task.done():
                 task.cancel()
@@ -123,6 +153,10 @@ class _CallContext:
             with contextlib.suppress(Exception):
                 await self.bridge.leave()
             self.bridge = None
+        if self.cpcmreg_enabled and self.at_client is not None:
+            self.cpcmreg_enabled = False
+            with contextlib.suppress(Exception):
+                await self.at_client.cpcmreg_disable()
         for ring in (self.upstream, self.downstream):
             if ring is not None and not ring.is_closed:
                 with contextlib.suppress(Exception):
@@ -252,7 +286,11 @@ class EdgeOrchestrator:
             )
             return
 
-        ctx = _CallContext(call_id=call_id, modem_call_id=modem_call_id)
+        ctx = _CallContext(
+            call_id=call_id,
+            modem_call_id=modem_call_id,
+            at_client=self._at,
+        )
         self._calls[call_id] = ctx
         await self._send_dial_ack(call_id, accepted=True, reason="")
 
@@ -308,7 +346,28 @@ class EdgeOrchestrator:
         #    if RTC bring-up needs a few hundred ms.
         await self._send_call_event_connected(ctx.call_id)
 
-        # 2. Build per-call audio path.
+        # 2. Enable the SerialPcm audio byte stream (SIMCom modems only
+        #    emit PCM after AT+CPCMREG=1). Spec § "PCM 通道按 SIMCom AT
+        #    协议启停": SHALL succeed before audio_bridge.join_rtc;
+        #    failure SHALL emit HardwareAlert + hang up.
+        try:
+            await self._at.cpcmreg_enable()
+        except PcmEnableError as exc:
+            logger.warning(
+                "cpcmreg_enable_failed",
+                extra={"call_id": ctx.call_id, "detail": exc.detail},
+            )
+            await self._send_hardware_alert_pcm_enable_failed(exc.detail)
+            # Treat as a hardware-class hangup so the cloud worker
+            # routes to retry-followup rather than no-answer.
+            await self._handle_remote_hangup(ctx, cause="network_out_of_order")
+            # Best-effort modem hangup so the line doesn't stay off-hook.
+            with contextlib.suppress(Exception):
+                await self._at.hangup(ctx.modem_call_id)
+            return
+        ctx.cpcmreg_enabled = True
+
+        # 3. Build per-call audio path.
         upstream = PcmRingBuffer(
             capacity_bytes=self._ring_capacity,
             name=f"modem_upstream_{ctx.call_id}",
@@ -327,7 +386,7 @@ class EdgeOrchestrator:
         ctx.downstream = downstream
         ctx.bridge = bridge
 
-        # 3. Start RTC + pumps. Capture pump runs for the lifetime of
+        # 4. Start RTC + pumps. Capture pump runs for the lifetime of
         #    the call; the orchestrator's single capture / playback
         #    backends are bound to this call's rings.
         try:
@@ -360,6 +419,13 @@ class EdgeOrchestrator:
     async def _handle_remote_hangup(
         self, ctx: _CallContext, cause: str | None
     ) -> None:
+        if ctx.terminated:
+            # cpcmreg-enable failure path already emitted CallEvent +
+            # teardown; the manual_hangup URC from our subsequent
+            # at.hangup() round-trips through the pump and lands here
+            # a second time. Suppress the duplicate.
+            return
+        ctx.terminated = True
         await self._send_call_event_remote_hangup(ctx.call_id, cause)
         # Pop before teardown so duplicate events from cancel/at race
         # don't observe a half-torn context.
@@ -414,6 +480,29 @@ class EdgeOrchestrator:
             )
         )
         await self._grpc.send(msg, critical=False)
+
+    async def _send_hardware_alert_pcm_enable_failed(self, detail: str) -> None:
+        """Emit a HardwareAlert when ``AT+CPCMREG=1`` fails.
+
+        Spec § "PCM 通道按 SIMCom AT 协议启停 (CPCMREG)" calls this kind
+        ``"pcm_enable_failed"`` in prose; the wire-level proto reuses
+        the existing ``ModemInitFailed`` oneof with
+        ``stage=PCM_ENABLE_FAILED_STAGE`` to avoid bumping
+        ``isales-common`` for D1. Cloud-side workers classify by
+        ``stage``; the value here is documented in design.md Decision 8.
+        """
+        msg = pb.Edge2Cloud(
+            hardware_alert=pb.HardwareAlert(
+                ts=_now_ts(),
+                modem_init_failed=pb.ModemInitFailed(
+                    stage=PCM_ENABLE_FAILED_STAGE,
+                    detail=detail,
+                ),
+            )
+        )
+        # HardwareAlert is critical: we want the cloud to record the
+        # failure even if the gRPC stream is currently in reconnect.
+        await self._grpc.send(msg, critical=True)
 
     async def _send_call_event_remote_hangup(
         self, call_id: str, cause: str | None

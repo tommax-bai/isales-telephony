@@ -33,8 +33,8 @@ struct PcmFrame {
 /// not worth the lock-free complexity for v1.0.
 ///
 /// On overflow (Python drainer too slow), the OLDEST frame is dropped
-/// and `dropped` is incremented. The choice matches the WASAPI overflow
-/// counter style in isales_telephony/modem_controller/audio/windows_wasapi.py.
+/// and `dropped` is incremented. The drop-oldest choice keeps the
+/// freshest audio flowing to the consumer.
 class FrameRingBuffer {
 public:
     explicit FrameRingBuffer(std::size_t capacity_frames);

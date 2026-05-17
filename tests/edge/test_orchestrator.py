@@ -16,8 +16,11 @@ from isales_common.proto import cloud_edge_pb2 as pb
 from isales_common.transport.cloud_edge import CloudEdgeClient, CloudMessageCallback
 
 from isales_telephony.audio_bridge.session import MacosRtcSession
-from isales_telephony.edge.orchestrator import EdgeOrchestrator
-from isales_telephony.modem_controller.at_client import ATEvent
+from isales_telephony.edge.orchestrator import (
+    PCM_ENABLE_FAILED_STAGE,
+    EdgeOrchestrator,
+)
+from isales_telephony.modem_controller.at_client import ATEvent, PcmEnableError
 
 # ---------- Fakes -----------------------------------------------------------
 
@@ -61,12 +64,35 @@ class _ScriptedATClient:
     queue (simulating URC after AT+H succeeds).
     """
 
-    def __init__(self, scripts: list[list[ATEvent]]) -> None:
+    def __init__(
+        self,
+        scripts: list[list[ATEvent]],
+        *,
+        cpcmreg_enable_error: PcmEnableError | None = None,
+        cpcmreg_disable_error: bool = False,
+    ) -> None:
         self._scripts = scripts
         self.dials: list[str] = []
         self.hangups: list[str] = []
+        # Public log of cpcmreg call ordering, so tests can assert
+        # CallEvent(connected) → cpcmreg_enable → join_rtc ordering.
+        self.cpcmreg_calls: list[str] = []
+        self._cpcmreg_enable_error = cpcmreg_enable_error
+        self._cpcmreg_disable_error = cpcmreg_disable_error
         self._queues: dict[str, asyncio.Queue[ATEvent | None]] = {}
         self._call_counter = 0
+
+    async def cpcmreg_enable(self) -> None:
+        self.cpcmreg_calls.append("enable")
+        if self._cpcmreg_enable_error is not None:
+            raise self._cpcmreg_enable_error
+
+    async def cpcmreg_disable(self) -> None:
+        self.cpcmreg_calls.append("disable")
+        # Per protocol, disable failure must NOT raise.
+        if self._cpcmreg_disable_error:
+            # Swallow as the SerialATClient would do internally.
+            return
 
     async def dial(self, number: str) -> tuple[str, AsyncIterator[ATEvent]]:
         self.dials.append(number)
@@ -164,9 +190,15 @@ def _build_orchestrator(
     at_scripts: list[list[ATEvent]],
     *,
     rtc_factory=None,
+    cpcmreg_enable_error: PcmEnableError | None = None,
+    cpcmreg_disable_error: bool = False,
 ) -> tuple[EdgeOrchestrator, _FakeGrpcClient, _ScriptedATClient, _NullPlayback]:
     grpc = _FakeGrpcClient()
-    at_client = _ScriptedATClient(at_scripts)
+    at_client = _ScriptedATClient(
+        at_scripts,
+        cpcmreg_enable_error=cpcmreg_enable_error,
+        cpcmreg_disable_error=cpcmreg_disable_error,
+    )
     capture = _NullCapture()
     playback = _NullPlayback()
     orch = EdgeOrchestrator(
@@ -325,6 +357,12 @@ async def test_dial_at_failure_negative_ack() -> None:
         async def hangup(self, call_id: str) -> None:  # pragma: no cover
             self.hangups.append(call_id)
 
+        async def cpcmreg_enable(self) -> None:  # pragma: no cover
+            return
+
+        async def cpcmreg_disable(self) -> None:  # pragma: no cover
+            return
+
     grpc = _FakeGrpcClient()
     at = _BrokenAT()
     orch = EdgeOrchestrator(
@@ -341,4 +379,110 @@ async def test_dial_at_failure_negative_ack() -> None:
     assert ack.accepted is False
     assert "at_dial" in ack.reason
     assert orch.active_call_ids == ()
+    await orch.stop()
+
+
+# ---------- §4.10 cpcmreg lifecycle (windows-client-core amend) -------------
+
+
+@pytest.mark.asyncio
+async def test_handle_connected_calls_cpcmreg_enable_before_join() -> None:
+    """Spec § "PCM 通道按 SIMCom AT 协议启停": CPCMREG=1 SHALL fire
+    after the CONNECT URC, before audio_bridge.join_rtc. On teardown
+    CPCMREG=0 SHALL fire after audio_bridge.leave_rtc."""
+    script = [
+        [
+            ATEvent(event="connected", call_id=""),
+            ATEvent(event="remote_hangup", call_id="", cause="normal_clearing"),
+        ]
+    ]
+    orch, grpc, at, _ = _build_orchestrator(script)
+    await orch.start()
+    await grpc.push_from_cloud(_dial_command())
+
+    for _ in range(50):
+        if "call_event:remote_hangup" in _kinds(grpc.sent):
+            break
+        await asyncio.sleep(0.01)
+
+    # Happy path: enable on connect, disable on teardown.
+    assert at.cpcmreg_calls == ["enable", "disable"]
+    await orch.stop()
+
+
+@pytest.mark.asyncio
+async def test_cpcmreg_enable_failure_emits_hardware_alert_and_hangs_up() -> None:
+    """CPCMREG=1 returning ERROR SHALL surface a HardwareAlert
+    (ModemInitFailed with stage=CPCMREG_ENABLE) and tear the call down
+    with a network_out_of_order remote_hangup."""
+    script = [
+        [ATEvent(event="connected", call_id="")],
+    ]
+    orch, grpc, at, playback = _build_orchestrator(
+        script,
+        cpcmreg_enable_error=PcmEnableError(detail="ERROR"),
+    )
+    await orch.start()
+    await grpc.push_from_cloud(_dial_command())
+
+    for _ in range(50):
+        if "call_event:remote_hangup" in _kinds(grpc.sent):
+            break
+        await asyncio.sleep(0.01)
+
+    # Expected wire frames: dial_ack → call_event:connected →
+    # hardware_alert → call_event:remote_hangup. Order of hardware_alert
+    # vs remote_hangup is "alert first" so cloud-side can correlate.
+    kinds = _kinds(grpc.sent)
+    assert "hardware_alert" in kinds
+    assert "call_event:remote_hangup" in kinds
+    alert_idx = kinds.index("hardware_alert")
+    hangup_idx = kinds.index("call_event:remote_hangup")
+    assert alert_idx < hangup_idx, kinds
+
+    # Stage label is the reused-ModemInitFailed contract.
+    alert = next(
+        f.hardware_alert for f in grpc.sent
+        if f.WhichOneof("payload") == "hardware_alert"
+    )
+    assert alert.WhichOneof("kind") == "modem_init_failed"
+    assert alert.modem_init_failed.stage == PCM_ENABLE_FAILED_STAGE
+
+    # Hangup cause is hardware-class so the cloud retries via retry-followup.
+    remote_hangup = next(
+        f.call_event.remote_hangup for f in grpc.sent
+        if f.WhichOneof("payload") == "call_event"
+        and f.call_event.WhichOneof("kind") == "remote_hangup"
+    )
+    assert remote_hangup.cause == pb.HangupCause.HANGUP_CAUSE_NETWORK_OUT_OF_ORDER
+
+    # cpcmreg_disable MUST NOT fire (enable failed → nothing to release).
+    assert at.cpcmreg_calls == ["enable"]
+    # Modem hangup was requested on the failure path.
+    assert len(at.hangups) == 1
+    # No audio was written.
+    assert playback.received_bytes == 0
+    # Call slot released.
+    assert orch.active_call_ids == ()
+    await orch.stop()
+
+
+@pytest.mark.asyncio
+async def test_cpcmreg_disable_not_called_when_call_drops_before_connected() -> None:
+    """no_answer / busy paths never reach _handle_connected, so
+    cpcmreg_enable/disable MUST NOT fire (modem audio DSP was never
+    holding a PCM context to release)."""
+    script = [
+        [ATEvent(event="remote_hangup", call_id="", cause="no_answer")]
+    ]
+    orch, grpc, at, _ = _build_orchestrator(script)
+    await orch.start()
+    await grpc.push_from_cloud(_dial_command())
+
+    for _ in range(50):
+        if "call_event:remote_hangup" in _kinds(grpc.sent):
+            break
+        await asyncio.sleep(0.01)
+
+    assert at.cpcmreg_calls == []
     await orch.stop()

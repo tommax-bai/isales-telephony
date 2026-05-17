@@ -118,12 +118,36 @@ class IdentifyResult:
     - ``is_at_channel=False, skipped_reason="probe_no_ok"`` → not a modem.
     - ``is_at_channel=False, skipped_reason="probe_io_error"`` → device
       mid-disconnect or busy; transient.
+
+    ``audio_serial_path`` is the path of the sibling audio COM port
+    used by :mod:`audio.windows_serial_pcm` on Windows for SIMCom-class
+    modems that expose MI_04 PCM as a ``Class=Ports`` serial port (e.g.
+    SIM7600G-H). Only populated on Windows, and only when an audio
+    sibling was successfully located in the USB composite — macOS /
+    Linux pass ``None`` (those platforms drive the modem audio through
+    Core Audio / ALSA, not a sibling serial port).
     """
 
     is_at_channel: bool
     identity: ModemIdentity | None = None
     init_failure: ModemInitFailedError | None = None
     skipped_reason: str | None = None
+    audio_serial_path: str | None = None
+
+
+AudioSerialPathFinder = Callable[[], str | None]
+"""Closure that resolves the audio-sibling COM port for the current modem.
+
+Called once by :func:`identify_modem_channel` after the candidate is
+confirmed as an AT channel. The closure captures whatever context it
+needs (USB composite ``serial_number``, VID, PID) at construction time
+so :func:`identify_modem_channel` does not need a third platform
+parameter.
+
+Windows callers wire
+:func:`isales_telephony.modem_controller.platforms.windows_serial.find_audio_serial_path`;
+macOS / Linux callers pass ``None``.
+"""
 
 
 # Rate limiter ----------------------------------------------------------------
@@ -426,6 +450,7 @@ async def identify_modem_channel(
     baudrate: int = DEFAULT_BAUDRATE,
     probe_timeout: float = DEFAULT_PROBE_TIMEOUT_S,
     command_timeout: float = DEFAULT_COMMAND_TIMEOUT_S,
+    audio_sibling_finder: AudioSerialPathFinder | None = None,
 ) -> IdentifyResult:
     """End-to-end: decide whether ``device_node`` is an AT channel and,
     if so, read its identity.
@@ -490,7 +515,22 @@ async def identify_modem_channel(
             ),
         )
 
-    return IdentifyResult(is_at_channel=True, identity=identity)
+    # Resolve the sibling audio COM port (Windows SerialPcm path only).
+    # Finder exceptions are swallowed — losing the audio path turns this
+    # call into a not-yet-usable modem, which the orchestrator surfaces
+    # via the usual HardwareAlert path when SerialPcm backend
+    # construction fails; the modem identity itself is still good news
+    # and should not be dropped on a flaky pyserial scan.
+    audio_path: str | None = None
+    if audio_sibling_finder is not None:
+        try:
+            audio_path = audio_sibling_finder()
+        except Exception:  # noqa: BLE001 — see docstring
+            audio_path = None
+
+    return IdentifyResult(
+        is_at_channel=True, identity=identity, audio_serial_path=audio_path
+    )
 
 
 __all__ = [
@@ -498,6 +538,7 @@ __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_S",
     "DEFAULT_PROBE_INTERVAL_S",
     "DEFAULT_PROBE_TIMEOUT_S",
+    "AudioSerialPathFinder",
     "IdentifyResult",
     "ModemIdentity",
     "ModemInitFailedError",

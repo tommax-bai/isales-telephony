@@ -88,12 +88,27 @@ def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
 
         return LinuxAlsaCapture(), LinuxAlsaPlayback()
     if backend == "windows":  # pragma: no cover — Windows-only path
-        from isales_telephony.modem_controller.audio.windows_wasapi import (
-            WindowsWASAPICapture,
-            WindowsWASAPIPlayback,
+        from isales_telephony.modem_controller.audio.windows_serial_pcm import (
+            WindowsSerialPcmCapture,
+            WindowsSerialPcmPlayback,
         )
 
-        return WindowsWASAPICapture(), WindowsWASAPIPlayback()
+        # SerialPcm needs the modem's audio COM port path; on Windows the
+        # SIMCom-class modem exposes MI_04 as a Class=Ports sibling COM
+        # (typically "COMxx" with description containing "Audio"). D1
+        # PoC reads this from env; the full discovery wiring (USB watcher
+        # → identify_modem_channel → audio_serial_path) is post-D1 work
+        # noted in tasks.md §3 footer.
+        audio_path = os.environ.get("ISALES_MODEM_AUDIO_SERIAL_PATH")
+        if not audio_path:
+            raise RuntimeError(
+                "ISALES_MODEM_AUDIO_SERIAL_PATH is required for the windows "
+                "audio backend (e.g. 'COM11'); see deploy/edge/windows/env.example.txt"
+            )
+        return (
+            WindowsSerialPcmCapture(audio_path),
+            WindowsSerialPcmPlayback(audio_path),
+        )
     raise RuntimeError(f"unknown ISALES_EDGE_AUDIO_BACKEND={backend!r}")
 
 

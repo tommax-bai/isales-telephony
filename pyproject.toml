@@ -69,14 +69,19 @@ macos = [
     'sounddevice>=0.4.6',
 ]
 # Windows backend extras (windows-client-core D1).
-# - sounddevice: WASAPI capture/playback for the modem audio device
 # - pystray + PySide6 + qasync: tray icon + activation UX + Qt/asyncio
 #   event-loop integration (single-process Python edge client)
 # - pywin32: HKCU Run-key registration + tray notify
+# Note: sounddevice / PortAudio is intentionally absent. v1.0 modem SKU
+# (SIMCom SIM7600G-H) does not register a USB Audio Class endpoint on
+# Windows; audio I/O goes through the SerialPcm-over-COM backend (see
+# isales_telephony.modem_controller.audio.windows_serial_pcm) which
+# uses pyserial (already in main deps). Decision logged in
+# windows-client-core/design.md Decision 3 amend (2026-05-17).
+# pyserial is in main `dependencies`; no Windows-only PortAudio wheel.
 # Markers MUST keep macOS / Linux installs clean — none of these wheels
 # install on non-Windows hosts.
 windows = [
-    'sounddevice>=0.4.6; platform_system == "Windows"',
     'pystray>=0.19; platform_system == "Windows"',
     'PySide6>=6.6; platform_system == "Windows"',
     'qasync>=0.27; platform_system == "Windows"',

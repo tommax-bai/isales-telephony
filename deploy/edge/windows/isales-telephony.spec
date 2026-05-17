@@ -90,9 +90,10 @@ a = Analysis(
         "pystray._win32",
         "PIL.Image",
         "PIL.ImageDraw",
-        # sounddevice / cffi: PortAudio wrapper.
-        "sounddevice",
-        "_cffi_backend",
+        # SerialPcm-over-COM replaced WASAPI as the v1.0 audio backend
+        # (windows-client-core design.md Decision 3 amend 2026-05-17);
+        # sounddevice / _cffi_backend hidden imports removed accordingly.
+        # pyserial is already a main dependency and visible to PyInstaller.
         # Project-local pybind11 binding for the ARTC Windows SDK. The
         # .pyd ships via `binaries` glob; this hidden import ensures
         # PyInstaller's depscan treats it as a module reference.

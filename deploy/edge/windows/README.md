@@ -52,17 +52,19 @@
 
 **长期解决**：D3 `windows-installer-and-ota` 引入 EV Authenticode 代码签名后默认不再拦。
 
-### Q2 WASAPI 找不到 modem 音频设备
+### Q2 找不到 modem 音频通道（SerialPcm）
 
 **症状**：托盘图标红色不转绿，或绿了但没声音。
 
+**机制**：v1.0 主 SKU（SIM7600G-H）在 Windows 上**不注册** USB Audio Class endpoint；客户端通过 modem 的 audio COM 串口（SIMCom MI_04，典型 pyserial description 含 "Audio"）以 8 kHz int16 LE 帧 read / write PCM 字节流，per-call 由 `AT+CPCMREG=1/0` 启停（详见 `windows-client-core/design.md` Decision 3 + 8）。
+
 **排查**：
 
-1. 控制面板 → 声音 → 录制 / 播放，**确认 modem 注册为 USB Audio Class 设备**（典型名字含 "USB Audio Device" / "Mobile" / 厂商名）。
-2. 重新插拔 modem，让 Windows 重新枚举设备。
-3. 在客户端右键托盘 → "查看日志"，搜 `wasapi:`，能看到匹配到哪个设备。
-4. 如果默认设备误命中（如笔记本内置麦克风），暂时关闭内置麦克风 / 把 modem 设为默认设备再启客户端。
-5. 低延迟要求强场景：env 文件加 `ISALES_WASAPI_MODE=exclusive`（注意会占用 modem 设备，QQ / 微信会议同时跑可能冲突）。
+1. 控制面板 → 设备管理器 → 端口（COM 和 LPT），**确认 modem 暴露多个 COM 端口**（典型 SIMCom 5 个：AT / Audio / Diagnostics / NMEA / Modem）。
+2. PowerShell 跑 `python -c "import serial.tools.list_ports as lp; [print(p.device, p.description) for p in lp.comports()]"`，确认能看到 description 含 "Audio" 的 COM。
+3. 重新插拔 modem，让 Windows 重新枚举（COM 号是动态分配，不能 hardcode 数字）。
+4. 客户端日志 `tray 右键 → 查看日志`，搜 `serial_pcm:` / `cpcmreg_`：前者是 backend open 错误（端口冲突 / 不存在），后者是 AT 控制面失败（`CPCMREG_ENABLE` HardwareAlert 上报云端）。
+5. 极端情况：发邮件给运维，附上日志目录最近一份 `telephony.log` + 设备管理器截图。
 
 ### Q3 多 COM 端口 modem 识别异常
 
