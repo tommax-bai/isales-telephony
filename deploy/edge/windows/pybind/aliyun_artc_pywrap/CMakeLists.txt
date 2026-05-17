@@ -78,10 +78,18 @@ target_include_directories(aliyun_artc_pywrap PRIVATE
 target_link_libraries(aliyun_artc_pywrap PRIVATE AliRTCSdk)
 
 # MSVC-specific flags — match what AliRTCSdk.lib is built with.
+#
+# Note on /permissive-: dropped 2026-05-17 after MSVC 19.44 rejected
+# vendor header rtc/engine_device_manager.h:51 with C7626 (`typedef struct
+# { int width = 0; ... } AliEngineVideoResolution;` — anonymous typedef
+# with in-class member initializers, valid under MS extensions but
+# disallowed under /permissive-). The ARTC SDK headers were built
+# against an older toolchain that accepted this. Our own bindings/*.cpp
+# files are C++17-conformant by design (per design.md Decision 2) so
+# losing /permissive- removes a defensive check without practical risk.
 if(MSVC)
     target_compile_options(aliyun_artc_pywrap PRIVATE
         /W3           # reasonable warnings
-        /permissive-  # strict conformance
         /utf-8        # treat sources as UTF-8 (binding strings have CJK comments)
     )
     target_compile_definitions(aliyun_artc_pywrap PRIVATE

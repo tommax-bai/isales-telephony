@@ -121,11 +121,19 @@ else {
 
     # 4d. Copy .pyd into the pybind source dir so PyInstaller spec's
     # `binaries` glob picks it up. design.md Decision 6.
-    $BuiltPyd = Join-Path $PybindBuildDir "Release\aliyun_artc_pywrap.pyd"
-    if (-not (Test-Path $BuiltPyd)) {
-        throw "CMake claimed success but $BuiltPyd is missing."
+    #
+    # pybind11 names the output with an ABI tag by default (e.g.
+    # `aliyun_artc_pywrap.cp312-win_amd64.pyd`); Python's import system
+    # accepts either the bare name or the ABI-tagged form. Glob so the
+    # script doesn't break when the tag string changes (Py version,
+    # arch).
+    $BuiltPyd = Get-ChildItem -Path (Join-Path $PybindBuildDir "Release") `
+        -Filter "aliyun_artc_pywrap*.pyd" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $BuiltPyd) {
+        throw "CMake claimed success but no aliyun_artc_pywrap*.pyd found under $PybindBuildDir\Release."
     }
-    Copy-Item -Path $BuiltPyd -Destination (Join-Path $PybindDir "aliyun_artc_pywrap.pyd") -Force
+    Copy-Item -Path $BuiltPyd.FullName -Destination (Join-Path $PybindDir $BuiltPyd.Name) -Force
 
     # 4e. Smoke import — fail fast if Python ABI mismatch.
     Push-Location $PybindDir
