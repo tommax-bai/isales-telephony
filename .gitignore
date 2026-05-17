@@ -29,3 +29,7 @@ ENV/
 deploy/edge/windows/vendor/aliyun-artc-windows/include/
 deploy/edge/windows/vendor/aliyun-artc-windows/x64/
 deploy/edge/windows/vendor/aliyun-artc-windows/x86/
+
+# Secrets / tokens — never commit
+*.jwt
+.edge-token-*
