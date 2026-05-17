@@ -21,13 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
+
+from isales_telephony.modem_controller.platforms import serial_lock
+from isales_telephony.modem_controller.platforms.serial_lock import (
+    BusyDeviceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +130,13 @@ async def _wait_or_cancelled(seconds: float, canceller: asyncio.Event) -> bool:
         return True
 
 
-class BusyDeviceError(RuntimeError):
-    """Failed to acquire exclusive lock on the serial device.
-
-    Raised by :meth:`SerialATClient.create_from_tty` when another process
-    already holds an ``fcntl.flock(LOCK_EX)`` on the tty fd.
-    """
+__all__ = [
+    "ATClient",
+    "ATEvent",
+    "BusyDeviceError",
+    "MockATClient",
+    "SerialATClient",
+]
 
 
 class SerialATClient:
@@ -206,29 +211,32 @@ class SerialATClient:
             reader, writer = await serial_asyncio.open_serial_connection(
                 url=tty_path, baudrate=baudrate
             )
-        except Exception as exc:  # noqa: BLE001 — surface as RuntimeError
+        except Exception as exc:  # noqa: BLE001 — classify before surfacing
+            # Windows OS-level exclusive open conflict surfaces as
+            # PermissionError / "Access is denied" SerialException; map
+            # it to BusyDeviceError so callers see one error type across
+            # platforms. POSIX open-time errors are deploy/permission
+            # misconfigurations, not lock contention — keep as RuntimeError.
+            busy = serial_lock.translate_open_error(exc, tty_path)
+            if busy is not None:
+                raise busy from exc
             raise RuntimeError(f"failed to open {tty_path}: {exc}") from exc
 
-        # Pull the underlying serial fd off pyserial-asyncio's transport so we
-        # can take an exclusive flock. Layout: transport.serial is the
-        # pyserial Serial object; .fd is the OS fd.
+        # Pull the underlying serial fd off pyserial-asyncio's transport.
+        # Layout: transport.serial is the pyserial Serial object; .fd is
+        # the POSIX OS fd. Windows pyserial does not expose a POSIX fd
+        # (no such concept) — fd=None there is expected and acquire_exclusive
+        # short-circuits to a no-op (OS already enforces exclusive open).
         transport = writer.transport
         serial_obj = getattr(transport, "serial", None)
         fd: int | None = getattr(serial_obj, "fd", None) if serial_obj else None
-        if fd is None:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-            raise RuntimeError(f"cannot resolve serial fd for {tty_path}")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            lock_handle = serial_lock.acquire_exclusive(fd, tty_path)
+        except (BusyDeviceError, RuntimeError):
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            raise BusyDeviceError(
-                f"{tty_path} is already locked by another process"
-            ) from exc
+            raise
 
         at = AtClient(reader, writer, default_timeout=5.0)
         at.start()
@@ -237,10 +245,9 @@ class SerialATClient:
             await driver.init()
         except Exception:
             await at.aclose()
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            serial_lock.release(lock_handle)
             raise
-        return cls(at, driver, lock_fd=fd)
+        return cls(at, driver, lock_fd=lock_handle)
 
     async def dial(self, number: str) -> tuple[str, AsyncIterator[ATEvent]]:
         """Issue ATD; return call_id + URC-translated event stream.
@@ -319,8 +326,7 @@ class SerialATClient:
         with contextlib.suppress(Exception):
             await self._at.aclose()
         if self._lock_fd is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            serial_lock.release(self._lock_fd)
             self._lock_fd = None
 
     # ----- internals -----
