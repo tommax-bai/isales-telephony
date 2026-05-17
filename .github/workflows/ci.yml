@@ -81,8 +81,12 @@ jobs:
         run: pip install -e ".[dev,windows]"
 
       - name: Pytest (windows suite)
-        # The Windows test dir is a self-contained subset; running the
-        # full suite on Windows currently trips on POSIX-only deps
-        # (fcntl in at_client.py — tracked as a follow-up PR per
-        # windows-client-core tasks.md § 3 trailing note).
-        run: pytest -v tests/windows tests/test_platforms_dispatch.py tests/modem_audio
+        # Scope: Windows-specific backend (tests/windows), cross-platform
+        # dispatch / shim layers (tests/test_platforms_dispatch.py +
+        # tests/modem_serial), and the modem / edge tests that became
+        # Windows-collectable once at_client.py stopped importing fcntl
+        # at module top level (windows-client-core §3.7-§3.9, PR #11).
+        # PG-gated tests skip here (the windows-latest runner has no
+        # PostgreSQL service container); they run in full on the
+        # lint-and-test job.
+        run: pytest -v tests/windows tests/test_platforms_dispatch.py tests/modem_audio tests/modem_serial tests/test_modem_dial.py tests/test_modem_pump_cancel.py tests/test_fake_modem_e2e.py tests/edge/test_orchestrator.py
