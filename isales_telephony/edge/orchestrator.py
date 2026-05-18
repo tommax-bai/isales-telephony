@@ -60,6 +60,8 @@ from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyp
 from isales_common.proto import cloud_edge_pb2 as pb
 from isales_common.transport.cloud_edge import CloudEdgeClient
 
+from isales_common.audio.rtc import RtcSession
+
 from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
 from isales_telephony.audio_bridge.session import MacosRtcSession
@@ -101,7 +103,13 @@ _HANGUP_CAUSE_TO_PROTO: dict[str, int] = {
 }
 
 
-RtcSessionFactory = Callable[[], MacosRtcSession]
+RtcSessionFactory = Callable[[], RtcSession]
+
+
+#: Vendor-raw label stamped on Edge2Cloud.remote_hangup when dev mode
+#: tears down via SIGINT / SIGTERM. The cloud worker classifies this
+#: as a non-retryable terminate (see macos-artc-pyobjc-binding spec).
+DEV_TERMINATE_CAUSE = "dev_terminate"
 
 
 def _now_ts() -> Timestamp:
@@ -121,6 +129,10 @@ class _CallContext:
     upstream: PcmRingBuffer | None = None
     downstream: PcmRingBuffer | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    # dev-no-modem path stashes the RtcSession directly (no AudioBridge
+    # wrapping it, because there is no modem PCM stream to bridge to).
+    # teardown() calls leave() on it like it would on bridge.
+    rtc_session: RtcSession | None = None
     # True iff AT+CPCMREG=1 succeeded for this call and AT+CPCMREG=0 has
     # not been sent yet. Gates teardown's cpcmreg_disable so we don't
     # spam ERRORs on calls that never reached connected.
@@ -153,6 +165,11 @@ class _CallContext:
             with contextlib.suppress(Exception):
                 await self.bridge.leave()
             self.bridge = None
+        # dev-no-modem: rtc_session is owned directly, not via AudioBridge.
+        if self.rtc_session is not None:
+            with contextlib.suppress(Exception):
+                await self.rtc_session.leave()
+            self.rtc_session = None
         if self.cpcmreg_enabled and self.at_client is not None:
             self.cpcmreg_enabled = False
             with contextlib.suppress(Exception):
@@ -190,11 +207,15 @@ class EdgeOrchestrator:
         self,
         *,
         grpc_client: CloudEdgeClient,
-        at_client: ATClient,
-        capture: CaptureBackend,
-        playback: PlaybackBackend,
+        at_client: ATClient | None = None,
+        capture: CaptureBackend | None = None,
+        playback: PlaybackBackend | None = None,
         rtc_session_factory: RtcSessionFactory | None = None,
         ring_capacity_bytes: int = 32 * 1024,
+        dev_no_modem: bool = False,
+        dev_channel: str | None = None,
+        dev_uid: str | None = None,
+        dev_peer_uid: str | None = None,
     ) -> None:
         self._grpc = grpc_client
         self._at = at_client
@@ -212,6 +233,23 @@ class EdgeOrchestrator:
         # re-create the pump tasks rather than gating capture on a
         # "call active?" flag — simpler reasoning, same cost.
         self._started = False
+        # dev-no-modem mode (macOS dev / QA, see
+        # macos-artc-pyobjc-binding spec). When True, the orchestrator
+        # bypasses the modem stack entirely: no SerialATClient, no
+        # CPCMREG, no capture / playback pumps. DialCommand is routed
+        # straight into rtc_session.join. dev_channel / dev_uid /
+        # dev_peer_uid are informational labels logged for correlation.
+        self._dev_no_modem = dev_no_modem
+        self._dev_channel = dev_channel
+        self._dev_uid = dev_uid
+        self._dev_peer_uid = dev_peer_uid
+        if not dev_no_modem:
+            if at_client is None or capture is None or playback is None:
+                raise ValueError(
+                    "EdgeOrchestrator requires at_client / capture / playback "
+                    "in production mode; pass dev_no_modem=True for the macOS "
+                    "dev / QA path."
+                )
 
     # ===== Lifecycle =====================================================
 
@@ -231,10 +269,13 @@ class EdgeOrchestrator:
             ctx = self._calls.pop(call_id, None)
             if ctx is not None:
                 await ctx.teardown()
-        with contextlib.suppress(Exception):
-            await self._capture.close()
-        with contextlib.suppress(Exception):
-            await self._playback.close()
+        # dev_no_modem mode has no HW backends to close.
+        if self._capture is not None:
+            with contextlib.suppress(Exception):
+                await self._capture.close()
+        if self._playback is not None:
+            with contextlib.suppress(Exception):
+                await self._playback.close()
         self._started = False
 
     # ===== gRPC inbound ==================================================
@@ -274,6 +315,11 @@ class EdgeOrchestrator:
             await self._send_dial_ack(call_id, accepted=True, reason="duplicate")
             return
 
+        if self._dev_no_modem:
+            await self._on_dial_dev_no_modem(dial)
+            return
+
+        assert self._at is not None  # validated in __init__
         try:
             modem_call_id, at_events = await self._at.dial(dial.number)
         except Exception as exc:  # noqa: BLE001 — surface as ACK failure
@@ -416,6 +462,72 @@ class EdgeOrchestrator:
             )
         )
 
+    # ===== Dev-no-modem flow (macOS dev / QA, no GSM modem) =============
+
+    async def _on_dial_dev_no_modem(self, dial: pb.DialCommand) -> None:
+        """Dev-mode dial: skip AT, go straight to RTC join.
+
+        Spec: macos-artc-pyobjc-binding device-hardware §
+        "macOS dev-no-modem orchestrator 路径".
+
+        - Synthetic ``modem_call_id="dev-fake"``.
+        - DialAck(accepted=true) emitted immediately.
+        - CallEvent(connected) emitted right after (mac mic / speaker
+          are handled by ARTC SDK default audio device routing).
+        - rtc_session.join() uses the cloud-supplied rtc_channel /
+          rtc_token / rtc_uid_edge (same as the modem path).
+        - No CPCMREG, no capture / playback pumps, no AudioBridge.
+        """
+        call_id = dial.call_id
+        ctx = _CallContext(call_id=call_id, modem_call_id="dev-fake")
+        self._calls[call_id] = ctx
+        await self._send_dial_ack(call_id, accepted=True, reason="")
+
+        logger.info(
+            "dev_no_modem_dial_accepted",
+            extra={
+                "call_id": call_id,
+                "dev_channel_label": self._dev_channel,
+                "dev_uid_label": self._dev_uid,
+                "rtc_channel": dial.rtc_channel,
+                "rtc_uid_edge": dial.rtc_uid_edge,
+            },
+        )
+
+        # Emit CallEvent(connected) before RTC join so the cloud's
+        # state machine sees "connected" promptly (mirrors real path).
+        await self._send_call_event_connected(call_id)
+
+        rtc_session = self._rtc_factory()
+        ctx.rtc_session = rtc_session
+        try:
+            await rtc_session.join(
+                channel=dial.rtc_channel,
+                token=dial.rtc_token,
+                uid=dial.rtc_uid_edge,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "dev_no_modem_rtc_join_failed", extra={"call_id": call_id},
+            )
+            await self._handle_remote_hangup(ctx, cause="network_out_of_order")
+            return
+
+    async def dev_terminate_active_calls(self) -> None:
+        """Emit remote_hangup{dev_terminate} for every in-flight call.
+
+        Invoked by the dev daemon's SIGINT / SIGTERM handler before
+        :meth:`stop`. The CallEvent is non-critical (best-effort);
+        :meth:`stop` will tear down the RTC sessions regardless.
+        """
+        for call_id in list(self._calls.keys()):
+            ctx = self._calls.get(call_id)
+            if ctx is None or ctx.terminated:
+                continue
+            await self._handle_remote_hangup(ctx, cause=DEV_TERMINATE_CAUSE)
+
+    # ===== Hangup =======================================================
+
     async def _handle_remote_hangup(
         self, ctx: _CallContext, cause: str | None
     ) -> None:
@@ -444,6 +556,12 @@ class EdgeOrchestrator:
                 extra={"call_id": cancel.call_id},
             )
             return
+        if self._dev_no_modem:
+            # No modem to hang up; tear down the RTC session directly
+            # and emit remote_hangup so the cloud retires the call.
+            await self._handle_remote_hangup(ctx, cause="manual_hangup")
+            return
+        assert self._at is not None  # validated in __init__
         try:
             await self._at.hangup(ctx.modem_call_id)
         except Exception:  # noqa: BLE001 — AT hangup failure must not

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import TYPE_CHECKING
 
@@ -50,24 +51,50 @@ if TYPE_CHECKING:
     from isales_common.audio.rtc import RtcSession
 
 
+logger = logging.getLogger(__name__)
+
+
 def get_default_rtc_session_class() -> type["RtcSession"]:
     """Return the platform-appropriate :class:`RtcSession` implementation.
 
     - ``win32`` → :class:`WindowsRtcSession` (real ARTC via pybind11).
-    - ``darwin`` → :class:`MacosRtcSession` (mock loopback; A2 QA path).
+    - ``darwin`` → :class:`MacosArtcPyObjCSession` (real ARTC via PyObjC
+      bridge, dev / QA) when the optional ``[macos-artc]`` extras +
+      ``AliRTCSdk.framework`` are present. Falls back to
+      :class:`MacosRtcSession` mock loopback when they are not (WARN
+      log + install hint).
     - other → ``NotImplementedError``.
 
-    The Windows binding (``aliyun_artc_pywrap``) is imported lazily so the
-    rest of the package keeps importing cleanly on macOS / Linux for tests.
+    Both real bindings (Windows pybind11, macOS PyObjC) import lazily so
+    the rest of the package keeps importing cleanly on every platform
+    for tests.
     """
     if sys.platform == "win32":
         from isales_telephony.audio_bridge.windows_rtc_session import WindowsRtcSession
         return WindowsRtcSession
     if sys.platform == "darwin":
-        return MacosRtcSession
+        try:
+            from isales_telephony.audio_bridge.macos_artc_pyobjc import (
+                MacosArtcPyObjCSession,
+            )
+            return MacosArtcPyObjCSession
+        except ImportError as exc:
+            logger.warning(
+                "macos_artc_pyobjc_unavailable_fallback_to_mock",
+                extra={
+                    "detail": str(exc),
+                    "hint": (
+                        "pip install -e '.[macos-artc]' and unzip "
+                        "AliRTCSdk_macos to ~/codes/vendor/AliRTCSdk_macos/ "
+                        "to enable real ARTC on macOS dev / QA"
+                    ),
+                },
+            )
+            return MacosRtcSession
     raise NotImplementedError(
         f"No edge RtcSession implementation for platform {sys.platform!r}. "
-        "macOS走 mock，Windows 走 pybind11 binding；Linux 边缘形态不支持 (v1.0)。"
+        "macOS走 PyObjC binding (fallback mock)，Windows 走 pybind11 binding；"
+        "Linux 边缘形态不支持 (v1.0)。"
     )
 
 

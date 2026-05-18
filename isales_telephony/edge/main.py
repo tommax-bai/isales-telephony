@@ -31,6 +31,14 @@ Optional services:
   the two units separate means a telephony-api crash doesn't kill the
   control plane.
 
+Dev / QA mode (macOS only):
+
+- ``--dev-no-modem`` skips the modem stack entirely. The orchestrator
+  routes Cloud2Edge.dial straight into ``rtc_session.join`` using the
+  real Aliyun ARTC PaaS via :class:`MacosArtcPyObjCSession`. mac mic /
+  speaker are handled by the ARTC SDK's default audio device routing.
+  Spec: openspec/changes/macos-artc-pyobjc-binding/.
+
 Shutdown: SIGTERM triggers an asyncio cancellation that propagates
 through the task group; the orchestrator's :meth:`stop` runs cleanly
 and tears down all in-flight calls before the process exits.
@@ -38,12 +46,14 @@ and tears down all in-flight calls before the process exits.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
 import signal
+import sys
 
-from isales_telephony.audio_bridge.session import MacosRtcSession
+from isales_telephony.audio_bridge import get_default_rtc_session_class
 from isales_telephony.edge.orchestrator import EdgeOrchestrator
 from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
@@ -126,9 +136,53 @@ def _build_event_buffer() -> SqliteEventBuffer | None:
     return buf
 
 
-async def _arun() -> None:
-    logging.basicConfig(level=os.environ.get("ISALES_LOG_LEVEL", "INFO"))
+def build_argparser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser.
 
+    Exposed for unit tests (see ``tests/edge/test_main_cli.py``).
+    """
+    p = argparse.ArgumentParser(
+        prog="isales-telephony-edge",
+        description=(
+            "iSales edge daemon. Production: env-configured, attached to "
+            "a real GSM modem. Dev / QA (macOS only): --dev-no-modem "
+            "skips the modem stack and uses real ARTC via PyObjC."
+        ),
+    )
+    p.add_argument(
+        "--dev-no-modem",
+        action="store_true",
+        help=(
+            "macOS dev / QA only: skip modem stack, run audio over real "
+            "ARTC via PyObjC binding. Fails fast on non-macOS hosts."
+        ),
+    )
+    p.add_argument(
+        "--dev-channel",
+        type=str,
+        default=None,
+        help="dev RTC channel label (informational; cloud DialCommand "
+        "supplies the actual rtc_channel used for join).",
+    )
+    p.add_argument(
+        "--dev-uid",
+        type=str,
+        default=None,
+        help="dev RTC uid label (informational; cloud DialCommand "
+        "supplies the actual rtc_uid_edge used for join).",
+    )
+    p.add_argument(
+        "--dev-peer-uid",
+        type=str,
+        default=None,
+        help="dev RTC peer uid label (informational).",
+    )
+    return p
+
+
+async def _arun_real(args: argparse.Namespace) -> None:
+    """Production / non-dev startup: env-configured, modem-attached."""
+    del args  # production path is env-driven; CLI flags are dev-only
     endpoint = _required_env("ISALES_CLOUD_EDGE_ENDPOINT")
     token = _required_env("ISALES_EDGE_DEVICE_TOKEN")
 
@@ -142,7 +196,7 @@ async def _arun() -> None:
         at_client=at_client,
         capture=capture,
         playback=playback,
-        rtc_session_factory=MacosRtcSession,
+        rtc_session_factory=get_default_rtc_session_class(),
     )
 
     stop_event = asyncio.Event()
@@ -182,10 +236,97 @@ async def _arun() -> None:
         logger.info("edge_daemon_stopped")
 
 
-def run() -> None:
-    """Console-script entry point: ``isales-telephony-edge``."""
+async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
+    """macOS dev / QA startup: no modem, real ARTC via PyObjC.
+
+    Cloud-side still drives DialCommand → DialAck → CallEvent the same
+    way. The orchestrator's dev path uses ``dial.rtc_channel`` and
+    ``dial.rtc_token`` from the cloud (same as the modem path); the
+    ``--dev-channel`` / ``--dev-uid`` flags are informational labels
+    written into the structured log so dev sessions are easy to
+    correlate.
+    """
+    endpoint = _required_env("ISALES_CLOUD_EDGE_ENDPOINT")
+    token = _required_env("ISALES_EDGE_DEVICE_TOKEN")
+    event_buffer = _build_event_buffer()
+
+    grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
+    orchestrator = EdgeOrchestrator(
+        grpc_client=grpc_client,
+        rtc_session_factory=get_default_rtc_session_class(),
+        dev_no_modem=True,
+        dev_channel=args.dev_channel,
+        dev_uid=args.dev_uid,
+        dev_peer_uid=args.dev_peer_uid,
+    )
+
+    stop_event = asyncio.Event()
+
+    def _request_stop() -> None:
+        logger.info("edge_daemon_signal_received_stop_dev")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:  # pragma: no cover — non-Unix
+            signal.signal(sig, lambda *_: _request_stop())
+
     try:
-        asyncio.run(_arun())
+        await grpc_client.start(endpoint=endpoint, token=token)
+        await orchestrator.start()
+        logger.info(
+            "edge_daemon_started_dev_no_modem",
+            extra={
+                "endpoint": endpoint,
+                "dev_channel": args.dev_channel,
+                "dev_uid": args.dev_uid,
+                "dev_peer_uid": args.dev_peer_uid,
+            },
+        )
+        await stop_event.wait()
+    finally:
+        logger.info("edge_daemon_stopping_dev")
+        # Dev teardown: emit remote_hangup{dev_terminate} for any
+        # in-flight call before tearing down the RTC sessions, so the
+        # cloud's state machine retires the call cleanly.
+        await orchestrator.dev_terminate_active_calls()
+        await orchestrator.stop()
+        await grpc_client.stop()
+        if event_buffer is not None:
+            event_buffer.close()
+        logger.info("edge_daemon_stopped_dev")
+
+
+async def _arun(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=os.environ.get("ISALES_LOG_LEVEL", "INFO"))
+    if args.dev_no_modem:
+        await _arun_dev_no_modem(args)
+    else:
+        await _arun_real(args)
+
+
+def run(argv: list[str] | None = None) -> None:
+    """Console-script entry point: ``isales-telephony-edge``.
+
+    Args:
+        argv: argv tail to parse. ``None`` uses ``sys.argv[1:]``.
+            Exposed for unit-tests (see ``tests/edge/test_main_cli.py``).
+    """
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+
+    if args.dev_no_modem and sys.platform != "darwin":
+        print(
+            "--dev-no-modem 仅 macOS 支持；Windows 商用走真 GSM modem + "
+            "windows-artc-pybind11 真 ARTC 路径。",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    try:
+        asyncio.run(_arun(args))
     except KeyboardInterrupt:  # pragma: no cover
         logger.info("edge_daemon_keyboard_interrupt")
 
