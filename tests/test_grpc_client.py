@@ -12,6 +12,8 @@ isales-engine), and connects the client against it. Tests focus on:
 - Buffering non-critical sends during disconnect + flush on reconnect.
 - ``critical=True`` raises EdgeNotConnected when disconnected.
 - Token forwarded as ``authorization: Bearer <token>``.
+- Channel constructed with HTTP/2 keepalive options + ``cloud_edge_stream_connected``
+  INFO log fires on every successful initial_metadata (cloud-edge-grpc-keepalive).
 """
 
 from __future__ import annotations
@@ -586,3 +588,165 @@ async def test_durable_buffer_survives_client_restart(tmp_path: object) -> None:
             await server.stop(grace=0.1)
     finally:
         buf2.close()
+
+
+# ---------------------------------------------------------------------------
+# cloud-edge-grpc-keepalive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_constructed_with_keepalive_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec: cloud-edge-grpc-keepalive § "edge gRPC client 启用 HTTP/2 keepalive
+    默认参数". Failing this means a refactor dropped the channel options
+    and stream lifetime would silently regress.
+    """
+    captured: list[dict[str, object]] = []
+    real_insecure = grpc.aio.insecure_channel
+
+    def _spy_insecure(target, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append({"target": target, **kwargs})
+        return real_insecure(target, **kwargs)
+
+    monkeypatch.setattr(grpc.aio, "insecure_channel", _spy_insecure)
+
+    server, servicer, target = await _start_server()
+    client = CloudEdgeGrpcClient(initial_backoff_s=0.05)
+    try:
+        await client.start(target, "good-token")
+        for _ in range(50):
+            if client.is_connected:
+                break
+            await asyncio.sleep(0.02)
+        assert client.is_connected
+    finally:
+        await client.stop()
+        await server.stop(grace=0.1)
+
+    assert captured, "insecure_channel was not invoked"
+    options = dict(captured[0].get("options") or [])
+    assert options.get("grpc.keepalive_time_ms") == 30000
+    assert options.get("grpc.keepalive_timeout_ms") == 10000
+    assert options.get("grpc.keepalive_permit_without_calls") == 1
+    assert options.get("grpc.http2.max_pings_without_data") == 0
+    assert options.get("grpc.http2.min_time_between_pings_ms") == 10000
+    assert options.get(
+        "grpc.http2.min_ping_interval_without_data_ms",
+    ) == 10000
+
+
+@pytest.mark.asyncio
+async def test_stream_connected_log_fires_on_initial_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec: cloud-edge-grpc-keepalive § "stream 上线 + 上线时分别打 INFO 日志".
+
+    The edge client SHALL emit ``cloud_edge_stream_connected`` exactly
+    when ``call.initial_metadata()`` returns successfully, so dev / ops
+    can correlate against the server's ``cloud_edge_stream_opened``.
+    """
+    import logging
+
+    caplog.set_level(
+        logging.INFO, logger="isales_telephony.transport.grpc_client",
+    )
+    server, _servicer, target = await _start_server()
+    client = CloudEdgeGrpcClient(initial_backoff_s=0.05)
+    try:
+        await client.start(target, "good-token")
+        for _ in range(50):
+            if client.is_connected:
+                break
+            await asyncio.sleep(0.02)
+        assert client.is_connected
+    finally:
+        await client.stop()
+        await server.stop(grace=0.1)
+
+    matches = [
+        r for r in caplog.records
+        if r.getMessage() == "cloud_edge_stream_connected"
+    ]
+    assert matches, "expected at least one cloud_edge_stream_connected INFO line"
+    # The structured extra MUST carry endpoint so ops can grep by ECS IP.
+    assert getattr(matches[-1], "endpoint", None) == target
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_unavailable_during_stream_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec: cloud-edge-grpc-keepalive § "edge gRPC client 启用 HTTP/2 keepalive"
+    +  service-communication § "断线重连与本地 buffer".
+
+    Models the Aliyun "Socket closed 1ms after initial_metadata"
+    pattern. We can't precisely inject `AioRpcError(UNAVAILABLE)` into
+    the bidi stream from an external test without a custom transport;
+    the closest fixture-friendly trigger is a full server stop/start
+    cycle, which produces the same ``AioRpcError(UNAVAILABLE)`` in
+    ``_connect_loop``. The contract under test is: client logs the
+    ``cloud_edge_stream_connected`` marker on EACH successful
+    re-establishment + ``cloud_edge_stream_error`` between them.
+    """
+    import logging
+
+    caplog.set_level(
+        logging.INFO, logger="isales_telephony.transport.grpc_client",
+    )
+
+    server1, _servicer1, target = await _start_server()
+    port = int(target.rsplit(":", 1)[1])
+    client = CloudEdgeGrpcClient(initial_backoff_s=0.05, max_backoff_s=0.2)
+    try:
+        await client.start(target, "good-token")
+        for _ in range(50):
+            if client.is_connected:
+                break
+            await asyncio.sleep(0.02)
+        assert client.is_connected
+
+        # Tear server down → client's `async for response in call:` gets
+        # an AioRpcError(UNAVAILABLE) on next read, which the
+        # _connect_loop catches as a stream error.
+        await server1.stop(grace=0.05)
+        for _ in range(200):
+            if not client.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        assert client.is_connected is False
+
+        # Bring back a fresh server on the same port — backoff re-attempts
+        # land on the new instance + the marker log fires a second time.
+        servicer2 = _TestServicer(accepted_tokens={"good-token"})
+        server2 = grpc.aio.server()
+        cloud_edge_pb2_grpc.add_CloudEdgeServicer_to_server(servicer2, server2)
+        server2.add_insecure_port(f"127.0.0.1:{port}")
+        await server2.start()
+        try:
+            for _ in range(400):
+                if client.is_connected:
+                    break
+                await asyncio.sleep(0.01)
+            assert client.is_connected is True
+        finally:
+            await server2.stop(grace=0.05)
+    finally:
+        await client.stop()
+
+    connected_logs = [
+        r for r in caplog.records
+        if r.getMessage() == "cloud_edge_stream_connected"
+    ]
+    error_logs = [
+        r for r in caplog.records
+        if r.getMessage() == "cloud_edge_stream_error"
+    ]
+    assert len(connected_logs) >= 2, (
+        "expected ≥ 2 cloud_edge_stream_connected (initial + post-reconnect); "
+        f"saw {len(connected_logs)}"
+    )
+    assert error_logs, (
+        "expected at least one cloud_edge_stream_error during reconnect"
+    )

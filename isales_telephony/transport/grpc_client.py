@@ -47,6 +47,21 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
 
+#: HTTP/2 keepalive channel options. Symmetric to the server-side options
+#: in isales-engine's grpc_server. Keeps long-lived bidi streams alive
+#: across Aliyun ECS / SLB / customer-NAT stateful idle-cleanup. Each
+#: side sends a HTTP/2 PING every 30 s and tears down if no ACK in 10 s.
+#: Spec: openspec/changes/cloud-edge-grpc-keepalive/.
+_KEEPALIVE_CHANNEL_OPTIONS: list[tuple[str, int]] = [
+    ("grpc.keepalive_time_ms", 30000),
+    ("grpc.keepalive_timeout_ms", 10000),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_pings_without_data", 0),
+    ("grpc.http2.min_time_between_pings_ms", 10000),
+    ("grpc.http2.min_ping_interval_without_data_ms", 10000),
+]
+
+
 class DurableEventBuffer(Protocol):
     """Minimal surface CloudEdgeGrpcClient needs from a durable buffer.
 
@@ -270,7 +285,9 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
         assert self._endpoint is not None
         assert self._token is not None
 
-        self._channel = grpc.aio.insecure_channel(self._endpoint)
+        self._channel = grpc.aio.insecure_channel(
+            self._endpoint, options=_KEEPALIVE_CHANNEL_OPTIONS,
+        )
         stub = cloud_edge_pb2_grpc.CloudEdgeStub(  # type: ignore[no-untyped-call]
             self._channel,
         )
@@ -288,6 +305,10 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
         # raises :class:`AioRpcError` for ``UNAUTHENTICATED`` / connection
         # refused, which the connect loop catches and retries.
         await call.initial_metadata()
+        logger.info(
+            "cloud_edge_stream_connected",
+            extra={"endpoint": self._endpoint},
+        )
         self._connected.set()
         await self._flush_buffer()
         try:
