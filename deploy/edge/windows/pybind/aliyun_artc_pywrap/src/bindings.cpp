@@ -239,6 +239,46 @@ public:
         }
     }
 
+    // 2-arg JoinChannel(AliEngineAuthInfo, userName) — ARTC RTC primary
+    // form. 把 nonce + timestamp + appId 等 fields 单独传给 SDK，roomserver
+    // 端能重算 sha256(appId+appKey+channel+uid+nonce+timestamp) 验签。
+    // 4-arg form 只 carry token, server 没 nonce 算不出对的 hash → 33620485
+    // AliEngineErrorJoinBadToken (实测 2026-05-24)。
+    //
+    // role + tokenType 留 nullptr：role 由 SetClientRole 单独设；tokenType
+    // 默认即可 (SDK 自识别 sha256-hex format)。
+    void join_channel_with_authinfo(const std::string &channel_id,
+                                     const std::string &user_id,
+                                     const std::string &app_id,
+                                     const std::string &nonce,
+                                     const std::string &token,
+                                     unsigned long long timestamp,
+                                     const std::string &user_name) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            AliRTCSdk::AliEngineAuthInfo auth{};
+            // const_cast OK — SDK reads-only inside JoinChannel synchronously
+            // (call completes before any background SDK thread touches the
+            // struct), and these strings outlive the call via local scope.
+            auth.channelId = const_cast<char*>(channel_id.c_str());
+            auth.userId    = const_cast<char*>(user_id.c_str());
+            auth.appId     = const_cast<char*>(app_id.c_str());
+            auth.nonce     = const_cast<char*>(nonce.c_str());
+            auth.token     = const_cast<char*>(token.c_str());
+            auth.timestamp = timestamp;
+            py::gil_scoped_release nogil;
+            rc = engine_->JoinChannel(auth, user_name.c_str());
+        }
+        if (rc != 0) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "JoinChannel(AuthInfo) returned rc=%d (0x%08X)", rc, rc);
+            throw AliyunArtcError(rc, buf);
+        }
+    }
+
     void leave_channel() {
         int rc;
         {
@@ -296,7 +336,7 @@ PYBIND11_MODULE(aliyun_artc_pywrap, m) {
 
     // Module version — bumped manually when binding ABI changes. Pyinstaller
     // logs this on startup as part of the smoke check.
-    m.attr("__version__") = "0.1.0";
+    m.attr("__version__") = "0.2.0";  // +join_channel_with_authinfo
 
     py::register_exception<AliyunArtcError>(m, "AliyunArtcError");
 
@@ -390,6 +430,11 @@ PYBIND11_MODULE(aliyun_artc_pywrap, m) {
              py::arg("enabled"))
         .def("join_channel",              &EngineHandle::join_channel,
              py::arg("token"), py::arg("channel"), py::arg("user_id"),
+             py::arg("user_name") = std::string())
+        // 2-arg AuthInfo form — preferred for ARTC RTC (4-arg fails验签).
+        .def("join_channel_with_authinfo", &EngineHandle::join_channel_with_authinfo,
+             py::arg("channel_id"), py::arg("user_id"), py::arg("app_id"),
+             py::arg("nonce"), py::arg("token"), py::arg("timestamp"),
              py::arg("user_name") = std::string())
         .def("leave_channel",             &EngineHandle::leave_channel)
         .def("destroy",                   &EngineHandle::destroy);

@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 
 DEFAULT_SSH_HOST = "root@121.89.85.150"
-DEFAULT_SSH_KEY = "C:/Users/tianx/codes/isales.pem"
+DEFAULT_SSH_KEY = "C:/Users/tianx/codes/isales-4.pem"  # 2026-05-24 rotation
 
 # CLI 路径 ssh 跑：sudo -u isales -H -E env $(cat engine.env | xargs)
 # /opt/isales/current/venv/bin/isales-engine-mint-rtc-token --channel X
@@ -109,12 +109,15 @@ def main(argv: list[str] | None = None) -> int:
     # 加载会失败 → process 静默 exit。用 os.add_dll_directory 手动注入。
     import os as _os
 
-    if hasattr(_os, "add_dll_directory"):
-        pybind_dir = _os.path.dirname(
-            _os.path.abspath(__file__)
-        ) + r"\..\deploy\edge\windows\pybind\aliyun_artc_pywrap"
-        pybind_dir = _os.path.normpath(pybind_dir)
-        if _os.path.isdir(pybind_dir):
+    pybind_dir = _os.path.dirname(
+        _os.path.abspath(__file__)
+    ) + r"\..\deploy\edge\windows\pybind\aliyun_artc_pywrap"
+    pybind_dir = _os.path.normpath(pybind_dir)
+    if _os.path.isdir(pybind_dir):
+        if pybind_dir not in sys.path:
+            sys.path.insert(0, pybind_dir)
+            print(f"      added sys.path: {pybind_dir}", file=sys.stderr)
+        if hasattr(_os, "add_dll_directory"):
             _os.add_dll_directory(pybind_dir)
             print(f"      added DLL dir: {pybind_dir}", file=sys.stderr)
         # Also check pybind PYTHONPATH location (override via env)
@@ -175,25 +178,38 @@ def main(argv: list[str] | None = None) -> int:
     print(f"      external audio stream_id = {stream_id}", file=sys.stderr)
     engine.publish_local_audio_stream(True)
 
+    # ARTC RTC 用 2-arg JoinChannel(AliEngineAuthInfo, userName) form。4-arg
+    # form 只 carry token, server 端无 nonce/timestamp 无法验签 (实测
+    # 2026-05-24: 33620485 / AliEngineErrorJoinBadToken)。AuthInfo 把 nonce
+    # + timestamp + appId 等单独 marshal 给 SDK。
     print(
-        f"[3/4] join_channel(channel={args.channel!r}, user_id={args.user_id!r}) ...",
+        f"[3/4] join_channel_with_authinfo(channel={args.channel!r}, "
+        f"user_id={args.user_id!r}, nonce={creds['nonce']!r}, "
+        f"expires_at={creds['expires_at']}) ...",
         file=sys.stderr,
     )
     t0 = time.time()
     try:
-        engine.join_channel(creds["token"], args.channel, args.user_id, args.user_id)
+        engine.join_channel_with_authinfo(
+            channel_id=creds["channel"],
+            user_id=creds["user_id"],
+            app_id=creds["app_id"],
+            nonce=creds["nonce"],
+            token=creds["token"],
+            timestamp=creds["expires_at"],
+            user_name=args.user_id,
+        )
     except artc.AliyunArtcError as e:
-        # 把真 rc 暴露出来 - AliyunArtcError 有 .code attr，hex 形式更容易查 SDK 错误码表
         rc_val = getattr(e, "code", None) or getattr(e, "args", [None])[0] or "?"
         rc_hex = f"0x{int(rc_val):08X}" if isinstance(rc_val, int) else "?"
         engine.destroy()
         sys.exit(
-            f"error: JoinChannel native rc={rc_val} ({rc_hex}); err: {e}\n"
-            "ARTC SDK 错误码上 5 字节是 module ID，下 3 字节具体 error:\n"
-            "  0x01010xxx: AliEngineErrorJoinChannel* family (e.g.,\n"
-            "    0x01010406 PublishNotJoinChannel, 0x01010550 SubscribeNotJoinChannel)\n"
-            "  0x01037D81 (16974081): 之前 on_join 异步报的相同 code\n"
-            "见 vendor header engine_interface.h:680-720 错误码 enum"
+            f"error: JoinChannel(AuthInfo) native rc={rc_val} ({rc_hex}); err: {e}\n"
+            "常见 ARTC RTC join 错误 (vendor engine_interface.h):\n"
+            "  0x01030101 JoinBadParam: AuthInfo 字段为空 / timestamp<=0\n"
+            "  0x02010201 JoinBadAppId / 0x02010202 InvaildAppId\n"
+            "  0x02010203 InvaildChannel: channel name 不合法 / 失效\n"
+            "  0x02010205 JoinBadToken: token 验签失败 (检查 AppKey + algorithm)"
         )
 
     if not join_event.wait(timeout=5.0):

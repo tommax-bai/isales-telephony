@@ -33,3 +33,4 @@ deploy/edge/windows/vendor/aliyun-artc-windows/x86/
 # Secrets / tokens — never commit
 *.jwt
 .edge-token-*
+scripts/_pybind_join_probe.py
