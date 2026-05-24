@@ -27,7 +27,7 @@ in `[[feedback-ground-truth-before-pending]]` memory.
 | Arch | x86_64 |
 | User | `tianx` |
 | Repo root | `C:\Users\tianx\codes\` (7 sibling repos flat-laid: isales meta + isales-common + isales-api + isales-engine + isales-scheduler + isales-worker + isales-telephony + isales-web) |
-| SSH key for ECS | `C:\Users\tianx\codes\isales.pem` (RSA, fingerprint `SHA256:ESKEddFU95g0ytlCZyTYEg3T4SHYNe7oBVPHpWQI5k0`) |
+| SSH key for ECS | `C:\Users\tianx\codes\isales-4.pem` (2026-05-24 rotation; 验 `ssh-keygen -lf` 该路径)。历史: `isales.pem` (2026-05-17 install-time, 已失效) → `isales-3.pem` (2026-05-19 mac rotation, 已失效) → `isales-4.pem` (2026-05-24, current) |
 
 ## Installed toolchain (added 2026-05-17 by `winget`-or-direct-installer flow)
 
