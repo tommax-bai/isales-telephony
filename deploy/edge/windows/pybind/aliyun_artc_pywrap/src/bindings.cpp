@@ -21,6 +21,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -169,6 +170,57 @@ public:
         media_engine_->RemoveExternalAudioStream(stream_id);
     }
 
+    // Channel setup setters — Windows ARTC native API 用 setter pattern；
+    // 不像 Linux Python wrapper 把这些打包成 JoinChannelConfig struct 传给
+    // 5-arg JoinChannel。Per engine_interface.h:3843 SetChannelProfile +
+    // :3855 SetClientRole + :4189 PublishLocalAudioStream。SHALL 在 join_
+    // channel 之前依序调（per windows-artc-pybind11-join-config spec
+    // § "Join channel setup 调用顺序约束"）。
+
+    void set_channel_profile(AliRTCSdk::AliEngineChannelProfile profile) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->SetChannelProfile(profile);
+        }
+        if (rc != 0) {
+            throw AliyunArtcError(rc, "SetChannelProfile returned non-zero");
+        }
+    }
+
+    void set_client_role(AliRTCSdk::AliEngineClientRole role) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->SetClientRole(role);
+        }
+        if (rc != 0) {
+            throw AliyunArtcError(rc, "SetClientRole returned non-zero");
+        }
+    }
+
+    // SetExternalAudioSource 不在 Windows ARTC native API 上 (该接口仅
+    // 出现在 Linux Python wrapper 层)；Windows 用既有
+    // EngineHandle::add_external_audio_stream (调 IAliEngineMediaEngine::
+    // AddExternalAudioStream) 创建外部音频流，效果等价。
+
+    void publish_local_audio_stream(bool enabled) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->PublishLocalAudioStream(enabled);
+        }
+        if (rc != 0) {
+            throw AliyunArtcError(rc, "PublishLocalAudioStream returned non-zero");
+        }
+    }
+
     void join_channel(const std::string &token, const std::string &channel,
                       const std::string &user_id, const std::string &user_name) {
         int rc;
@@ -180,7 +232,10 @@ public:
                                        user_id.c_str(), user_name.c_str());
         }
         if (rc != 0) {
-            throw AliyunArtcError(rc, "JoinChannel returned non-zero");
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "JoinChannel returned rc=%d (0x%08X)", rc, rc);
+            throw AliyunArtcError(rc, buf);
         }
     }
 
@@ -245,6 +300,22 @@ PYBIND11_MODULE(aliyun_artc_pywrap, m) {
 
     py::register_exception<AliyunArtcError>(m, "AliyunArtcError");
 
+    // ARTC SDK enum bindings — 仅暴露 v1.0 audio-only 场景需要的常量
+    // (per windows-artc-pybind11-join-config spec § "必绑定的最小 SDK
+    // 接口集" + design D2)。增 enum constant 走独立 change。
+    // 注: ARTC SDK 用 typedef enum，值在外层 AliRTCSdk:: 命名空间下不是
+    // enum class 嵌套；pybind11 暴露名仍可任意。
+    py::enum_<AliRTCSdk::AliEngineChannelProfile>(m, "AliEngineChannelProfile")
+        .value("ChannelProfileCommunication", AliRTCSdk::AliEngineCommunication)
+        .value("ChannelProfileInteractiveLive", AliRTCSdk::AliEngineInteractiveLive)
+        .export_values();
+
+    py::enum_<AliRTCSdk::AliEngineClientRole>(m, "AliEngineClientRole")
+        .value("AliEngineClientRoleInteractive",
+               AliRTCSdk::AliEngineClientRoleInteractive)
+        .value("AliEngineClientRoleLive", AliRTCSdk::AliEngineClientRoleLive)
+        .export_values();
+
     py::class_<PcmFrame>(m, "PcmFrame")
         .def_readonly("pcm",                &PcmFrame::pcm)
         .def_readonly("sample_rate",        &PcmFrame::sample_rate)
@@ -304,6 +375,19 @@ PYBIND11_MODULE(aliyun_artc_pywrap, m) {
              py::arg("stream_id"), py::arg("pcm"), py::arg("sample_rate") = 16000,
              py::arg("channels") = 1, py::arg("bytes_per_sample") = 2)
         .def("remove_external_audio_stream", &EngineHandle::remove_external_audio_stream)
+        // Channel setup setters (windows-artc-pybind11-join-config) — SHALL
+        // 在 join_channel 之前依序调:
+        //   set_channel_profile → set_client_role
+        //   → add_external_audio_stream (既有 binding，等价 Linux 的
+        //     SetExternalAudioSource —— Windows SDK 没有该 setter，
+        //     AddExternalAudioStream 创建外部 stream 即可)
+        //   → publish_local_audio_stream → join_channel
+        .def("set_channel_profile",       &EngineHandle::set_channel_profile,
+             py::arg("profile"))
+        .def("set_client_role",           &EngineHandle::set_client_role,
+             py::arg("role"))
+        .def("publish_local_audio_stream", &EngineHandle::publish_local_audio_stream,
+             py::arg("enabled"))
         .def("join_channel",              &EngineHandle::join_channel,
              py::arg("token"), py::arg("channel"), py::arg("user_id"),
              py::arg("user_name") = std::string())

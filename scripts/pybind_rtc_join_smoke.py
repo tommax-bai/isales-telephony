@@ -164,6 +164,17 @@ def main(argv: list[str] | None = None) -> int:
     listener.set_on_error(on_error)
     engine.set_event_listener(listener)
 
+    # Channel setup setters (windows-artc-pybind11-join-config) — SHALL
+    # 在 join_channel 之前依序调；缺任一会触发 ARTC SDK native rc != 0
+    # (2026-05-24 实测 rc=16974081)。
+    print("      setting up channel (profile / role / external audio) ...", file=sys.stderr)
+    engine.set_channel_profile(artc.AliEngineChannelProfile.ChannelProfileInteractiveLive)
+    engine.set_client_role(artc.AliEngineClientRole.AliEngineClientRoleInteractive)
+    # external audio stream 8 kHz mono 16-bit — iSales 标准音频格式
+    stream_id = engine.add_external_audio_stream(channels=1, sample_rate=8000)
+    print(f"      external audio stream_id = {stream_id}", file=sys.stderr)
+    engine.publish_local_audio_stream(True)
+
     print(
         f"[3/4] join_channel(channel={args.channel!r}, user_id={args.user_id!r}) ...",
         file=sys.stderr,
@@ -172,14 +183,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         engine.join_channel(creds["token"], args.channel, args.user_id, args.user_id)
     except artc.AliyunArtcError as e:
+        # 把真 rc 暴露出来 - AliyunArtcError 有 .code attr，hex 形式更容易查 SDK 错误码表
+        rc_val = getattr(e, "code", None) or getattr(e, "args", [None])[0] or "?"
+        rc_hex = f"0x{int(rc_val):08X}" if isinstance(rc_val, int) else "?"
         engine.destroy()
         sys.exit(
-            f"error: JoinChannel native rc!=0: {e}\n"
-            "ARTC SDK 常见 rc:\n"
-            "  -3: token 验签失败 (AppId 不对 / TTL 过 / nonce 重用)\n"
-            "  -4: engine state 错 (未 create / 已 join)\n"
-            "  -5: param 错 (channel 名 / user_id 空 / 长度超)\n"
-            "  其他: 见 ARTC SDK 错误码表"
+            f"error: JoinChannel native rc={rc_val} ({rc_hex}); err: {e}\n"
+            "ARTC SDK 错误码上 5 字节是 module ID，下 3 字节具体 error:\n"
+            "  0x01010xxx: AliEngineErrorJoinChannel* family (e.g.,\n"
+            "    0x01010406 PublishNotJoinChannel, 0x01010550 SubscribeNotJoinChannel)\n"
+            "  0x01037D81 (16974081): 之前 on_join 异步报的相同 code\n"
+            "见 vendor header engine_interface.h:680-720 错误码 enum"
         )
 
     if not join_event.wait(timeout=5.0):
