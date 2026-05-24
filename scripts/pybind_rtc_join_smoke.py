@@ -104,8 +104,25 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
-    # Import 延后: 仅 ARTC pybind .pyd 在 path 上才能进；提前 import 错误
-    # 信息不会带 mint context.
+    # Windows: ARTC vendor DLLs 不在系统 PATH 上时 `import .pyd` 会成功
+    # 但 EngineHandle.create() 内调用 C++ AliEngine::Create() 触发 DLL
+    # 加载会失败 → process 静默 exit。用 os.add_dll_directory 手动注入。
+    import os as _os
+
+    if hasattr(_os, "add_dll_directory"):
+        pybind_dir = _os.path.dirname(
+            _os.path.abspath(__file__)
+        ) + r"\..\deploy\edge\windows\pybind\aliyun_artc_pywrap"
+        pybind_dir = _os.path.normpath(pybind_dir)
+        if _os.path.isdir(pybind_dir):
+            _os.add_dll_directory(pybind_dir)
+            print(f"      added DLL dir: {pybind_dir}", file=sys.stderr)
+        # Also check pybind PYTHONPATH location (override via env)
+        for extra in (_os.environ.get("ARTC_DLL_DIR", ""),):
+            if extra and _os.path.isdir(extra):
+                _os.add_dll_directory(extra)
+                print(f"      added DLL dir: {extra}", file=sys.stderr)
+
     try:
         import aliyun_artc_pywrap as artc  # type: ignore[import-not-found]
     except ImportError as e:
@@ -117,34 +134,53 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print("[2/4] creating EngineHandle ...", file=sys.stderr)
-    engine = artc.EngineHandle.create(creds["app_id"])
+    engine = artc.EngineHandle()
+    # extras MUST 是 JSON 含 app_id；空字符串会触发 ARTC SDK native 侧
+    # 静默 abort (exit code 5, no traceback). Verified 2026-05-24.
+    extras_json = json.dumps({"app_id": creds["app_id"]})
+    engine.create(extras=extras_json)
 
     result = JoinResult()
     join_event = threading.Event()
 
-    class Listener:
-        def on_join_channel_result(self, code: int, channel: str) -> None:  # noqa: D401
-            result.code = code
-            result.join_event_at = time.time()
-            join_event.set()
-            print(
-                f"      on_join_channel_result(code={code}, channel={channel!r})",
-                file=sys.stderr,
-            )
+    # binding actual signature (engine_listener.cpp:56):
+    #   on_join(result: int, channel: str, user_id: str, elapsed_ms: int)
+    def on_join(code: int, channel: str, user_id: str, elapsed_ms: int) -> None:
+        result.code = code
+        result.join_event_at = time.time()
+        join_event.set()
+        print(
+            f"      on_join(code={code}, channel={channel!r}, "
+            f"user_id={user_id!r}, elapsed_ms={elapsed_ms})",
+            file=sys.stderr,
+        )
 
-        def on_error(self, code: int, msg: str) -> None:
-            result.error_events.append(f"code={code} msg={msg}")
-            print(f"      on_error: code={code} msg={msg!r}", file=sys.stderr)
+    def on_error(error: int, msg: str) -> None:
+        result.error_events.append(f"error={error} msg={msg}")
+        print(f"      on_error: error={error} msg={msg!r}", file=sys.stderr)
 
-    listener = Listener()
-    engine.set_listener(listener)
+    listener = artc.EngineListener()
+    listener.set_on_join(on_join)
+    listener.set_on_error(on_error)
+    engine.set_event_listener(listener)
 
     print(
         f"[3/4] join_channel(channel={args.channel!r}, user_id={args.user_id!r}) ...",
         file=sys.stderr,
     )
     t0 = time.time()
-    engine.join_channel(creds["token"], args.channel, args.user_id)
+    try:
+        engine.join_channel(creds["token"], args.channel, args.user_id, args.user_id)
+    except artc.AliyunArtcError as e:
+        engine.destroy()
+        sys.exit(
+            f"error: JoinChannel native rc!=0: {e}\n"
+            "ARTC SDK 常见 rc:\n"
+            "  -3: token 验签失败 (AppId 不对 / TTL 过 / nonce 重用)\n"
+            "  -4: engine state 错 (未 create / 已 join)\n"
+            "  -5: param 错 (channel 名 / user_id 空 / 长度超)\n"
+            "  其他: 见 ARTC SDK 错误码表"
+        )
 
     if not join_event.wait(timeout=5.0):
         engine.leave_channel()
