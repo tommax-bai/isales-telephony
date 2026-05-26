@@ -57,10 +57,10 @@ logger = logging.getLogger(__name__)
 def get_default_rtc_session_class() -> type["RtcSession"]:
     """Return the platform-appropriate :class:`RtcSession` implementation.
 
-    - ``win32`` → :class:`WindowsRtcSession` (real ARTC via pybind11).
-    - ``darwin`` → :class:`MacosArtcPyObjCSession` (real ARTC via PyObjC
-      bridge, dev / QA) when the optional ``[macos-artc]`` extras +
-      ``AliRTCSdk.framework`` are present. Falls back to
+    - ``win32`` → :class:`WindowsRtcSession` (real DingRTC via pybind11).
+    - ``darwin`` → :class:`MacosDingRtcPyObjCSession` (real DingRTC via
+      PyObjC bridge, dev / QA) when the optional ``[macos-dingrtc]``
+      extras + ``DingRTC.framework`` are present. Falls back to
       :class:`MacosRtcSession` mock loopback when they are not (WARN
       log + install hint).
     - other → ``NotImplementedError``.
@@ -74,19 +74,20 @@ def get_default_rtc_session_class() -> type["RtcSession"]:
         return WindowsRtcSession
     if sys.platform == "darwin":
         try:
-            from isales_telephony.audio_bridge.macos_artc_pyobjc import (
-                MacosArtcPyObjCSession,
+            from isales_telephony.audio_bridge.macos_dingrtc_pyobjc import (
+                MacosDingRtcPyObjCSession,
             )
-            return MacosArtcPyObjCSession
+            return MacosDingRtcPyObjCSession
         except ImportError as exc:
             logger.warning(
-                "macos_artc_pyobjc_unavailable_fallback_to_mock",
+                "macos_dingrtc_pyobjc_unavailable_fallback_to_mock",
                 extra={
                     "detail": str(exc),
                     "hint": (
-                        "pip install -e '.[macos-artc]' and unzip "
-                        "AliRTCSdk_macos to ~/codes/vendor/AliRTCSdk_macos/ "
-                        "to enable real ARTC on macOS dev / QA"
+                        "pip install -e '.[macos-dingrtc]' and unzip "
+                        "DingRTC_macOS_SDK_3_9_0.zip to "
+                        "~/codes/vendor/DingRTC_macOS_SDK_3_9_0/ to enable "
+                        "real DingRTC on macOS dev / QA"
                     ),
                 },
             )

@@ -341,19 +341,20 @@ async def test_drainer_stops_on_leave(fake_artc):
 def test_get_default_rtc_session_class_macos(monkeypatch, fake_artc):
     """Loading the Windows fake binding must not break the darwin route.
 
-    Per macos-artc-pyobjc-binding the darwin path now returns either the
-    real PyObjC binding (when ``[macos-artc]`` extras + the framework are
-    available) or the mock loopback as fallback. Explicit success /
-    fallback assertions live in tests/audio_bridge/test_init_routing.py;
-    here we only assert the windows binding's import surface does not
-    interfere with darwin routing.
+    Per engine-rtc-dingrtc-migration § 8 the darwin path now returns
+    either the real PyObjC binding (when ``[macos-dingrtc]`` extras +
+    the framework are available) or the mock loopback as fallback.
+    Explicit success / fallback assertions live in
+    tests/audio_bridge/test_init_routing.py; here we only assert the
+    windows binding's import surface does not interfere with darwin
+    routing.
     """
     fake, wrs = fake_artc
     from isales_telephony import audio_bridge
 
     monkeypatch.setattr(audio_bridge.sys, "platform", "darwin", raising=False)
     cls = audio_bridge.get_default_rtc_session_class()
-    assert cls.__name__ in {"MacosArtcPyObjCSession", "MacosRtcSession"}
+    assert cls.__name__ in {"MacosDingRtcPyObjCSession", "MacosRtcSession"}
 
 
 def test_get_default_rtc_session_class_linux_raises(monkeypatch, fake_artc):
