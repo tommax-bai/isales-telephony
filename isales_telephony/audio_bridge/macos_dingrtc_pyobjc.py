@@ -188,7 +188,18 @@ def _resolve_framework_path(framework_path: str | os.PathLike[str] | None) -> Pa
 
 
 def _load_framework(framework_path: str | os.PathLike[str] | None) -> dict[str, Any]:
-    """Load ``DingRTC.framework`` via PyObjC and return key Obj-C classes.
+    """Load ``DingRTC.framework`` and return key Obj-C classes.
+
+    Strategy: ``ctypes.CDLL(..., mode=RTLD_GLOBAL)`` the framework
+    binary (and its sibling ``libffmpeg.dylib`` dep) so Obj-C class
+    constructors register with the runtime, then look up each class
+    via ``objc.lookUpClass``. We deliberately avoid
+    ``objc.loadBundle`` — DingRTC.framework's ``@rpath`` deps don't
+    resolve through NSBundle's loader without setting DYLD env, and
+    requiring callers to set DYLD before launching python is a sharp
+    edge we'd rather not impose. Pre-loading dependencies through
+    ctypes is the documented PyObjC workaround for `@rpath`-burdened
+    third-party frameworks (PyObjC docs §"Loading frameworks").
 
     Returns a dict ``{name: class}`` so callers can grab
     ``DingRtcEngine`` / ``DingRtcAuthInfo`` / ``DingRtcAudioDataSample``
@@ -197,8 +208,8 @@ def _load_framework(framework_path: str | os.PathLike[str] | None) -> dict[str, 
 
     Raises:
         RtcError: if the path does not exist, is not a framework bundle,
-            ``objc.loadBundle`` rejects it (wrong arch / linker error),
-            or required Obj-C classes cannot be looked up after loading.
+            ``ctypes.CDLL`` rejects it (wrong arch / missing dep), or
+            required Obj-C classes cannot be looked up afterwards.
     """
     resolved = _resolve_framework_path(framework_path)
     if not resolved.exists():
@@ -222,32 +233,90 @@ def _load_framework(framework_path: str | os.PathLike[str] | None) -> dict[str, 
             f"`file {binary}` should report a Mach-O universal binary."
         )
 
-    module_globals = globals()
+    # Pre-load the vendor's sibling ffmpeg dep (the framework's
+    # ``otool -L`` lists ``@rpath/libffmpeg.dylib``); without it the
+    # subsequent CDLL on the framework binary fails to resolve symbols.
+    ffmpeg_dep = resolved.parent / "libffmpeg.dylib"
+    if ffmpeg_dep.exists():
+        try:
+            ctypes.CDLL(str(ffmpeg_dep), mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            raise RtcError(
+                f"ctypes.CDLL(libffmpeg.dylib) failed: {exc}",
+            ) from exc
+
     try:
+        ctypes.CDLL(str(binary), mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        raise RtcError(
+            f"ctypes.CDLL failed for {binary!s}: {exc}. "
+            f"Verify the binary is a universal Mach-O (run "
+            f"`file {binary}`) and the host architecture matches. "
+            f"If `@rpath/libfoo.dylib not found`, that dep needs to "
+            f"live in {resolved.parent!s}/ next to the framework.",
+        ) from exc
+
+    # After ctypes preload, NSBundle can resolve the framework's
+    # ``@rpath`` deps. Run ``objc.loadBundle`` so the Obj-C runtime
+    # registers DingRTC's formal protocols (e.g.
+    # ``DingRtcEngineDelegate``). Without protocol registration,
+    # PyObjC subclasses that try to claim conformance via
+    # ``protocols=[...]`` raise ``ProtocolError``, and the SDK
+    # segfaults when it invokes selectors on a non-conformant
+    # delegate.
+    with contextlib.suppress(Exception):
         objc.loadBundle(
             "DingRTC",
-            module_globals=module_globals,
+            module_globals=globals(),
             bundle_path=str(resolved),
         )
-    except Exception as exc:  # noqa: BLE001 — PyObjC raises a broad family
-        raise RtcError(
-            f"objc.loadBundle failed for {resolved!s}: {exc}. "
-            f"Verify the binary is a universal Mach-O (run "
-            f"`file {binary}`) and the host architecture matches."
-        ) from exc
 
     required = ("DingRtcEngine", "DingRtcAuthInfo", "DingRtcAudioDataSample")
     classes: dict[str, Any] = {}
     for name in required:
-        cls = module_globals.get(name)
-        if cls is None:
+        try:
+            cls = objc.lookUpClass(name)
+        except Exception as exc:  # noqa: BLE001 — PyObjC raises a broad family
             raise RtcError(
-                f"{name} Obj-C class not found after loading {resolved!s}. "
-                f"The framework may be stripped / wrong build; DingRTC 3.9.0 "
-                f"headers declare all of {required}."
-            )
+                f"objc.lookUpClass({name!r}) failed after loading "
+                f"{resolved!s}: {exc}. The framework may be stripped / wrong "
+                f"build; DingRTC 3.9.0 declares {required}.",
+            ) from exc
         classes[name] = cls
+
+    # Register the formal DingRtcEngineDelegate protocol on our
+    # delegate subclass once. PyObjC binds the protocol metadata at
+    # class creation time, so we re-create the class with the protocol
+    # if it hasn't been claimed yet. Idempotent on repeat loads.
+    _bind_engine_delegate_protocol()
     return classes
+
+
+_ENGINE_DELEGATE_PROTOCOL_BOUND = False
+
+
+def _bind_engine_delegate_protocol() -> None:
+    """Late-bind ``DingRtcEngineDelegate`` onto :class:`_DingRtcEngineDelegate`.
+
+    Idempotent. Lookup is best-effort: if the formal protocol metadata
+    is absent (e.g. older SDK patch), we leave the subclass as-is and
+    let runtime behaviour surface any conformance issue.
+    """
+    global _ENGINE_DELEGATE_PROTOCOL_BOUND
+    if _ENGINE_DELEGATE_PROTOCOL_BOUND:
+        return
+    try:
+        proto = objc.protocolNamed("DingRtcEngineDelegate")
+    except Exception:  # noqa: BLE001
+        return
+    # PyObjC exposes ``addObservedSelector`` / ``conformsToProtocol_``
+    # but the right way to attach a formal protocol post-class-creation
+    # is via the ``__pyobjc_protocols__`` attribute. Mutate cautiously.
+    existing = list(getattr(_DingRtcEngineDelegate, "__pyobjc_protocols__", []))
+    if proto not in existing:
+        existing.append(proto)
+        _DingRtcEngineDelegate.__pyobjc_protocols__ = existing  # type: ignore[attr-defined]
+    _ENGINE_DELEGATE_PROTOCOL_BOUND = True
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +899,11 @@ class MacosDingRtcPyObjCSession(RtcSession):
         _maybe_invoke(sample, "setBytesPerSample_", bytes_per_sample)
         _maybe_invoke(sample, "setNumOfChannels_", channels)
         _maybe_invoke(sample, "setSampleRate_", self._send_sample_rate)
-        _maybe_invoke(sample, "setTimestamp_", timestamp_ms)
+        # DingRtcAudioDataSample (3.9.0) does NOT expose a timestamp
+        # property; ``timestamp_ms`` is recorded only via push-side
+        # logging. The SDK derives timestamps internally from the
+        # capture clock + sampleRate.
+        _ = timestamp_ms
         self._push_sample = sample  # also keep alive; PyObjC may release
 
         try:
