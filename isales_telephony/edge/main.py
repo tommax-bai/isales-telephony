@@ -35,9 +35,12 @@ Dev / QA mode (macOS only):
 
 - ``--dev-no-modem`` skips the modem stack entirely. The orchestrator
   routes Cloud2Edge.dial straight into ``rtc_session.join`` using the
-  real Aliyun ARTC PaaS via :class:`MacosArtcPyObjCSession`. mac mic /
-  speaker are handled by the ARTC SDK's default audio device routing.
-  Spec: openspec/changes/macos-artc-pyobjc-binding/.
+  real Aliyun RTC PaaS (DingRTC 3.x) via
+  :class:`MacosDingRtcPyObjCSession`. mac mic / speaker are pumped
+  through the audio_bridge external-audio-source path (the DingRTC SDK
+  takes PCM via :meth:`push_audio` / :meth:`audio_frames`; the SDK's
+  internal Core Audio capture is not used).
+  Spec: openspec/changes/engine-rtc-dingrtc-migration § 8.
 
 Shutdown: SIGTERM triggers an asyncio cancellation that propagates
 through the task group; the orchestrator's :meth:`stop` runs cleanly
