@@ -70,11 +70,25 @@ class _StubAliRtcEngine:
         return cls()
 
 
+def _fake_selector(callable_obj: Any, **_kwargs: Any) -> Any:
+    """Pass-through stand-in for ``objc.selector``.
+
+    The real ``objc.selector(fn, signature=b'...')`` attaches an
+    Objective-C method-type-encoding metadata to ``fn`` so the SDK can
+    invoke it across the Cocoa/Python ABI without misinterpreting
+    primitive args. Tests don't exercise that ABI (no SDK present), so
+    we return the underlying callable unchanged — Python-side callers
+    still see the function with its normal Python signature.
+    """
+    return callable_obj
+
+
 def _make_fake_objc() -> ModuleType:
     mod = ModuleType("objc")
     mod.loadBundle = _default_load_bundle  # type: ignore[attr-defined]
     mod.super = _FakeObjcSuper  # type: ignore[attr-defined]
     mod.error = type("error", (Exception,), {})  # type: ignore[attr-defined]
+    mod.selector = _fake_selector  # type: ignore[attr-defined]
     return mod
 
 

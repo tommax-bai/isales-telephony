@@ -322,6 +322,57 @@ def _bind_engine_delegate_protocol() -> None:
 # ---------------------------------------------------------------------------
 # PyObjC delegates
 # ---------------------------------------------------------------------------
+#
+# Why every delegate selector below is wrapped in ``objc.selector(...,
+# signature=b'...')``: PyObjC's default auto-detection treats every
+# Python argument of an NSObject method as ``@`` (id). That is fine for
+# selectors called from Python, but the SDK invokes our delegate from
+# Objective-C using the C calling convention for the declared
+# signature in ``DingRtcEngine.h`` — primitive ``int`` / NSInteger
+# arguments live in integer registers, not as boxed objects. Without
+# an explicit signature PyObjC tries to autorelease / read those
+# integer-register values as ObjC pointers → instant SIGSEGV the moment
+# the SDK fires any callback with non-``@`` args.
+#
+# Signature reference (vendor header
+# ``DingRTC.framework/Headers/DingRtcEngine.h``):
+#
+# - ``onJoinChannelResult:channel:userId:elapsed:`` — ``(int, NSString *,
+#   NSString *, int)`` → ``v@:i@@i``
+# - ``onLeaveChannelResult:stats:`` — ``(int, DingRtcStats *)`` → ``v@:i@``
+# - ``onOccurError:message:`` — ``(int, NSString *)`` → ``v@:i@``
+# - ``onConnectionStatusChanged:reason:`` — both args are
+#   ``NS_ENUM(NSInteger, ...)`` (DingRtcConnectionStatus /
+#   DingRtcConnectionStatusChangeReason) → ``v@:qq``
+# - ``onRemoteUserOnLineNotify:elapsed:`` — ``(NSString *, int)`` → ``v@:@i``
+# - ``onRemoteUserOffLineNotify:offlineReason:`` — ``(NSString *,
+#   DingRtcUserOfflineReason)`` (NSInteger enum) → ``v@:@q``
+# - ``onPlaybackAudioFrame:`` — ``(DingRtcAudioDataSample *)`` → ``v@:@``
+#
+# Type-encoding cheat sheet (subset PyObjC uses):
+#   v=void  @=id  :=SEL  i=int (32-bit)  q=long long (64-bit, NSInteger
+#   on 64-bit macOS)  Q=unsigned long long (NSUInteger).
+
+
+def _typed_selector(signature: bytes):
+    """Wrap a Python method with an explicit PyObjC ABI signature.
+
+    Returns a decorator that calls ``objc.selector(fn,
+    signature=signature)``. The decorated attribute remains usable as a
+    regular Python method (PyObjC's ``selector`` is dual-purpose).
+
+    Use this on every NSObject subclass method that is invoked *from*
+    Objective-C (delegate callbacks, target-action handlers, etc.) and
+    takes any argument that is not ``id``. Methods called only from
+    Python (e.g. ``initWith…`` factory selectors invoked via PyObjC's
+    bridge) do not need this because PyObjC handles the marshalling
+    in that direction itself.
+    """
+
+    def deco(fn):  # noqa: ANN001 — internal helper
+        return objc.selector(fn, signature=signature)
+
+    return deco
 
 
 class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
@@ -361,9 +412,10 @@ class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
 
     # ---- channel lifecycle ------------------------------------------------
 
+    @_typed_selector(b"v@:i@@i")
     def onJoinChannelResult_channel_userId_elapsed_(
-        self, result: int, channel: str, user_id: str, elapsed: int,
-    ) -> None:
+        self, result, channel, user_id, elapsed,
+    ):
         # DingRTC 3.x adds the userId slot vs. the AliRTC 3-arg variant.
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
@@ -373,13 +425,15 @@ class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
                 int(result), str(channel), str(user_id), int(elapsed),
             )
 
-    def onLeaveChannelResult_stats_(self, result: int, _stats: Any) -> None:
+    @_typed_selector(b"v@:i@")
+    def onLeaveChannelResult_stats_(self, result, _stats):
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
         if loop is not None:
             loop.call_soon_threadsafe(session._on_leave_result, int(result))
 
-    def onOccurError_message_(self, error: int, message: str) -> None:
+    @_typed_selector(b"v@:i@")
+    def onOccurError_message_(self, error, message):
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
         if loop is not None:
@@ -387,7 +441,8 @@ class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
                 session._on_error, int(error), str(message),
             )
 
-    def onConnectionStatusChanged_reason_(self, status: int, reason: int) -> None:
+    @_typed_selector(b"v@:qq")
+    def onConnectionStatusChanged_reason_(self, status, reason):
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
         if loop is not None:
@@ -398,7 +453,8 @@ class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
 
     # ---- remote-user notifications ----------------------------------------
 
-    def onRemoteUserOnLineNotify_elapsed_(self, uid: str, elapsed: int) -> None:
+    @_typed_selector(b"v@:@i")
+    def onRemoteUserOnLineNotify_elapsed_(self, uid, elapsed):
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
         if loop is not None:
@@ -406,9 +462,8 @@ class _DingRtcEngineDelegate(NSObject):  # type: ignore[misc,valid-type]
                 session._on_remote_user_online, str(uid), int(elapsed),
             )
 
-    def onRemoteUserOffLineNotify_offlineReason_(
-        self, uid: str, reason: int,
-    ) -> None:
+    @_typed_selector(b"v@:@q")
+    def onRemoteUserOffLineNotify_offlineReason_(self, uid, reason):
         session = self._session  # type: ignore[attr-defined]
         loop = session._loop
         if loop is not None:
@@ -437,7 +492,8 @@ class _DingRtcAudioFrameDelegate(NSObject):  # type: ignore[misc,valid-type]
         self._session = session  # type: ignore[attr-defined]
         return self
 
-    def onPlaybackAudioFrame_(self, audio_frame: Any) -> None:
+    @_typed_selector(b"v@:@")
+    def onPlaybackAudioFrame_(self, audio_frame):
         """Mixed downstream PCM (post-merge across all remote uids).
 
         ``audio_frame`` is a ``DingRtcAudioDataSample`` Obj-C object.
