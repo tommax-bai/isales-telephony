@@ -148,16 +148,73 @@ async def run(args: argparse.Namespace) -> dict:
         f"[3/4] join channel={channel!r} as uid={user_id!r} ...",
         file=sys.stderr,
     )
+    sample_rate = args.sample_rate
     await session.join(
         channel, token, user_id,
-        send_sample_rate=args.sample_rate, send_channels=1,
+        send_sample_rate=sample_rate, send_channels=1,
     )
     print(f"[3/4]   joined; is_joined={session.is_joined}", file=sys.stderr)
 
+    push_count = 0
+    inbound_frames = 0
+    inbound_bytes = 0
+    first_inbound_at: float | None = None
+    started = time.monotonic()
+    push_task: asyncio.Task | None = None
+    drain_task: asyncio.Task | None = None
+
+    # Silence-push task — mirrors ECS scripts/ecs_pcm_loopback_listen.py so a
+    # dual-peer test produces symmetric inbound counters on both sides.
+    # 100 ms × sample_rate × 16-bit mono.
+    if args.push_silence:
+        silence_chunk_ms = 100
+        chunk_samples = int(sample_rate * silence_chunk_ms / 1000)
+        silence_pcm = b"\x00\x00" * chunk_samples
+
+        async def _push_loop() -> None:
+            nonlocal push_count
+            ts = 0
+            while True:
+                try:
+                    await session.push_audio(silence_pcm, timestamp_ms=ts)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"      push error: {exc}", file=sys.stderr)
+                    return
+                push_count += 1
+                ts += silence_chunk_ms
+                await asyncio.sleep(silence_chunk_ms / 1000)
+
+        push_task = asyncio.create_task(_push_loop())
+
+    if args.drain:
+        async def _drain_loop() -> None:
+            nonlocal inbound_frames, inbound_bytes, first_inbound_at
+            async for frame in session.audio_frames():
+                inbound_frames += 1
+                inbound_bytes += len(frame.pcm)
+                if first_inbound_at is None:
+                    first_inbound_at = time.monotonic()
+                    print(
+                        f"      first inbound frame at t+"
+                        f"{first_inbound_at - started:.2f}s "
+                        f"({len(frame.pcm)} bytes)",
+                        file=sys.stderr,
+                    )
+
+        drain_task = asyncio.create_task(_drain_loop())
+
     # Hold the channel long enough for the audio observer to confirm
-    # the inbound wire is live. Single-peer = SDK self-playback only,
-    # mirrors §5.4 ECS smoke pattern.
+    # the inbound wire is live. Single-peer (no flags) keeps the
+    # original §8.8 minimal-join behaviour; with --push-silence + --drain
+    # mirrors the ECS counter pattern for dual-peer evidence.
     await asyncio.sleep(args.duration)
+
+    import contextlib  # local — only needed when tasks were spawned
+    for t in (push_task, drain_task):
+        if t is not None:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
 
     print(f"[4/4] leaving ...", file=sys.stderr)
     await session.leave()
@@ -167,6 +224,12 @@ async def run(args: argparse.Namespace) -> dict:
         "app_id": app_id,
         "duration_s": args.duration,
         "real_mode": args.real,
+        "push_count": push_count,
+        "inbound_frames": inbound_frames,
+        "inbound_bytes": inbound_bytes,
+        "first_inbound_frame_at_s": (
+            first_inbound_at - started if first_inbound_at else None
+        ),
     }
 
 
@@ -186,6 +249,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--real", action="store_true",
         help="use real AppId + self-signed token (ISALES_RTC_APP_ID/KEY env)",
+    )
+    parser.add_argument(
+        "--push-silence", dest="push_silence", action="store_true",
+        help="push 100ms silence PCM chunks for the duration (dual-peer test)",
+    )
+    parser.add_argument(
+        "--drain", action="store_true",
+        help="consume audio_frames() and report inbound counters",
     )
     args = parser.parse_args(argv)
 
