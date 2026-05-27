@@ -254,9 +254,17 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     event_buffer = _build_event_buffer()
 
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
+
+    # dev path 走真 DingRTC 时必须经 `.production()` classmethod 拿 app_id —
+    # 直接 `cls()` ctor 默认 app_id="" 会在 `.join()` 阶段 RtcError. mock
+    # MacosRtcSession 没有 production(),保持 raw class fallback.
+    _rtc_cls = get_default_rtc_session_class()
+    _rtc_production = getattr(_rtc_cls, "production", None)
+    rtc_session_factory = _rtc_production if _rtc_production is not None else _rtc_cls
+
     orchestrator = EdgeOrchestrator(
         grpc_client=grpc_client,
-        rtc_session_factory=get_default_rtc_session_class(),
+        rtc_session_factory=rtc_session_factory,
         dev_no_modem=True,
         dev_channel=args.dev_channel,
         dev_uid=args.dev_uid,
