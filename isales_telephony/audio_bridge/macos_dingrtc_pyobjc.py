@@ -742,6 +742,23 @@ class MacosDingRtcPyObjCSession(RtcSession):
                 f"setExternalAudioSource failed: {exc}",
             ) from exc
 
+        # DingRTC default behavior: local audio stream NOT published to the
+        # channel after setExternalAudioSource(true). pushExternalAudioFrame
+        # then queues PCM into the SDK's internal buffer but the channel
+        # peer never receives it (engine-side inbound RMS=0 evidence,
+        # call 21+, mac mic_capture_pump pushing real audio with RMS up
+        # to 2700 but ECS engine sees silence). Explicit publish needed
+        # to wire push_audio output onto the channel.
+        try:
+            _maybe_invoke(engine, "publishLocalAudioStream_", True)
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal: log + continue. If the SDK rejects the call we
+            # still get the existing wire (mic upstream broken but
+            # downstream + RTC join intact).
+            logger.warning(
+                "macos_dingrtc_publish_local_audio_stream_failed: %s", exc,
+            )
+
         # Build DingRtcAuthInfo per the 3.x API shape.
         auth = auth_cls.alloc().init()
         _maybe_invoke(auth, "setChannelId_", channel)

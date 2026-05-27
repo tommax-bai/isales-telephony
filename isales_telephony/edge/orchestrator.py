@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -512,6 +513,90 @@ class EdgeOrchestrator:
             )
             await self._handle_remote_hangup(ctx, cause="network_out_of_order")
             return
+
+        # Start mic capture pump for upstream audio. MacosDingRtcPyObjCSession
+        # calls setExternalAudioSource(true, ...) which **disables** the SDK's
+        # default Core Audio mic capture — we must push mic PCM manually for
+        # the engine-side audio_frames() iterator to see anything other than
+        # silence. Without this, ASR receives 0 bytes and the silence_activation
+        # state machine fires until silence_max_reached (smoke calls 1-8 all
+        # took this path before this commit). 16 kHz mono 16-bit LE matches
+        # DingRTC engine-side send_sample_rate default (RtcSession ABC).
+        #
+        # Set ``ISALES_DEV_NO_MIC_CAPTURE=1`` to skip the pump (diagnostic
+        # toggle — useful when isolating whether mic upstream interferes
+        # with engine-side TTS push_audio path).
+        if os.environ.get("ISALES_DEV_NO_MIC_CAPTURE") != "1":
+            ctx.tasks.append(
+                asyncio.create_task(
+                    self._dev_no_modem_mic_capture_pump(ctx, rtc_session),
+                    name=f"mic_capture_{call_id}",
+                )
+            )
+
+    async def _dev_no_modem_mic_capture_pump(
+        self,
+        ctx: _CallContext,
+        rtc_session: RtcSession,
+    ) -> None:
+        """mac mic → rtc_session.push_audio loop for dev-no-modem path.
+
+        Runs until ``ctx.terminated`` flips or the task is cancelled by
+        :meth:`_CallContext.teardown`. Capture is opened lazily on first
+        ``read_chunk()`` and closed in the ``finally``. push_audio errors
+        are logged and swallowed — losing one 20 ms frame is not fatal
+        for the AI dialog turn.
+        """
+        from isales_telephony.audio_bridge.mac_mic_capture import (  # noqa: PLC0415
+            MacMicCapture,
+        )
+
+        capture = MacMicCapture()
+        ts_ms = 0
+        pushed = 0
+        last_log_t = 0.0
+        import time as _time  # noqa: PLC0415
+        try:
+            capture.open()
+            chunk_ms = capture.chunk_duration_ms
+            while not ctx.terminated:
+                chunk = await capture.read_chunk()
+                # Diagnostic: RMS volume of chunk so we can tell if mic is
+                # capturing silence vs real speech.
+                rms = 0
+                if chunk:
+                    n_samples = len(chunk) // 2
+                    if n_samples > 0:
+                        # int16 LE little-endian; quick RMS without numpy.
+                        total = 0
+                        for i in range(0, len(chunk), 2):
+                            s = int.from_bytes(chunk[i:i+2], "little", signed=True)
+                            total += s * s
+                        rms = int((total // max(n_samples, 1)) ** 0.5)
+                try:
+                    await rtc_session.push_audio(chunk, timestamp_ms=ts_ms)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dev_no_modem_mic_push_audio_failed call_id=%s err=%s",
+                        ctx.call_id, exc,
+                    )
+                pushed += 1
+                now = _time.monotonic()
+                if now - last_log_t >= 1.0:
+                    logger.info(
+                        "dev_no_modem_mic_push chunks=%s last_rms=%s last_chunk_bytes=%s",
+                        pushed, rms, len(chunk) if chunk else 0,
+                    )
+                    last_log_t = now
+                ts_ms += chunk_ms
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "dev_no_modem_mic_capture_pump_failed call_id=%s", ctx.call_id,
+            )
+        finally:
+            capture.stop()
 
     async def dev_terminate_active_calls(self) -> None:
         """Emit remote_hangup{dev_terminate} for every in-flight call.
