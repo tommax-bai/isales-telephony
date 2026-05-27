@@ -553,26 +553,11 @@ class EdgeOrchestrator:
 
         capture = MacMicCapture()
         ts_ms = 0
-        pushed = 0
-        last_log_t = 0.0
-        import time as _time  # noqa: PLC0415
         try:
             capture.open()
             chunk_ms = capture.chunk_duration_ms
             while not ctx.terminated:
                 chunk = await capture.read_chunk()
-                # Diagnostic: RMS volume of chunk so we can tell if mic is
-                # capturing silence vs real speech.
-                rms = 0
-                if chunk:
-                    n_samples = len(chunk) // 2
-                    if n_samples > 0:
-                        # int16 LE little-endian; quick RMS without numpy.
-                        total = 0
-                        for i in range(0, len(chunk), 2):
-                            s = int.from_bytes(chunk[i:i+2], "little", signed=True)
-                            total += s * s
-                        rms = int((total // max(n_samples, 1)) ** 0.5)
                 try:
                     await rtc_session.push_audio(chunk, timestamp_ms=ts_ms)
                 except Exception as exc:  # noqa: BLE001
@@ -580,14 +565,6 @@ class EdgeOrchestrator:
                         "dev_no_modem_mic_push_audio_failed call_id=%s err=%s",
                         ctx.call_id, exc,
                     )
-                pushed += 1
-                now = _time.monotonic()
-                if now - last_log_t >= 1.0:
-                    logger.info(
-                        "dev_no_modem_mic_push chunks=%s last_rms=%s last_chunk_bytes=%s",
-                        pushed, rms, len(chunk) if chunk else 0,
-                    )
-                    last_log_t = now
                 ts_ms += chunk_ms
         except asyncio.CancelledError:
             raise
