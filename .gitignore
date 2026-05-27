@@ -22,10 +22,26 @@ ENV/
 *.sock
 /var/run/isales/
 
-# Aliyun ARTC SDK for Windows — proprietary binaries / headers; drop the
-# unpacked SDK under deploy/edge/windows/vendor/aliyun-artc-windows/ but
-# never commit it. The PyInstaller spec globs DLLs from this path at
-# build time; absence yields a smoke-test binary that fails at RTC join.
+# Vendor RTC SDK binaries / headers — proprietary, never commit. Both
+# the OS-level vendor location (`~/codes/vendor/DingRTC_*_SDK_*/` — lives
+# outside any repo, no .gitignore needed for it) and any in-tree
+# placement under `deploy/edge/*/vendor/` are covered here.
+#
+# Post-`engine-rtc-dingrtc-migration` § 7 the canonical SDK is DingRTC
+# 3.9.0; the legacy AliRTC Windows lines remain in place until § 7.9
+# physically deletes the legacy `deploy/edge/windows/vendor/aliyun-artc-windows/`
+# tree from this repo's Windows checkouts. The DingRTC globs are
+# forward-compat — they kick in the moment someone unpacks a vendor zip
+# into the in-tree path.
+
+# DingRTC (post-§ 7)
+vendor/DingRTC_*_SDK_*/
+deploy/edge/windows/vendor/dingrtc-windows/
+deploy/edge/macos/vendor/DingRTC_*_SDK_*/
+
+# Legacy ApsaraVideo Live ARTC SDK for Windows (pre-§ 7) — delete the
+# three lines below in the same commit that runs § 7.9 cleanup on the
+# Windows dev rig.
 deploy/edge/windows/vendor/aliyun-artc-windows/include/
 deploy/edge/windows/vendor/aliyun-artc-windows/x64/
 deploy/edge/windows/vendor/aliyun-artc-windows/x86/
