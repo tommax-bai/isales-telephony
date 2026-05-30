@@ -1,8 +1,12 @@
 # Windows edge dev rig — current state snapshot
 
-**Last updated**: 2026-05-17 23:30 CST — Python 3.12 + CMake + VS BuildTools
-installed; `aliyun_artc_pywrap.pyd` built + import smoke green;
-SIM7600G-H modem on COM12 (AT) / COM11 (audio); cloud-edge gRPC smoke
+**Last updated**: 2026-05-30 — DingRTC Windows SDK 3.9.0 vendored at
+`~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 matches mac end-of-tasks.md §1.3);
+ARTC SDK + `aliyun_artc_pywrap.pyd` retained but **superseded** — see § "DingRTC
+SDK for Windows" below; `aliyun-artc-windows/` + `aliyun_artc_pywrap/` to be
+removed after Windows `dingrtc_pywrap` binding builds green + join smoke passes
+(`engine-rtc-dingrtc-migration` §7). Toolchain (Python 3.12 + CMake + VS BuildTools)
+unchanged; SIM7600G-H modem on COM12 (AT) / COM11 (audio); cloud-edge gRPC smoke
 to ECS green.
 
 This file is the Windows-dev-rig sibling of
@@ -62,7 +66,94 @@ repo is the canonical end-user install recipe for these tools.
 `.gitignore` covers `.venv*/` (widened 2026-05-17 commit `b9cd5de`) so
 both venvs stay out of git.
 
-## Aliyun ARTC SDK for Windows (vendored, gitignored)
+## DingRTC SDK for Windows (vendored, gitignored)
+
+Location: `C:\Users\tianx\codes\vendor\DingRTC_Windows_SDK_3_9_0\` (cross-repo
+shared vendor dir, **not** under `isales-telephony/`; matches three-end
+convention in `engine-rtc-dingrtc-migration/design.md` D9 — Linux uses
+`/opt/isales/vendor/DingRTC_Linux_SDK_3_9_0/`, macOS uses
+`~/codes/vendor/DingRTC_macOS_SDK_3_9_0/`).
+
+Vendor zip: `dingrtc.oss-cn-zhangjiakou.aliyuncs.com/sdk/windows/3.9.0/DingRTC_Windows_SDK_3_9_0.zip`
+(48.44 MB, 50797083 bytes).
+
+| Field | Value |
+|---|---|
+| Version | 3.9.0 (2025-04-15 release; three-end interop locked at same minor+patch per design.md D2) |
+| Downloaded | 2026-05-30 via `Invoke-WebRequest` |
+| SHA256 (zip) | `F59482589A211E3FC4368C4750DFA50603F03C0ACDF3D157728A41AC1CA19974` — **cross-platform match** with mac end's record in `engine-rtc-dingrtc-migration/tasks.md` §1.3 (`f59482589a211e3fc4368c4750dfa50603f03c0acdf3d157728a41ac1ca19974`); proves OSS-side zip identity across dev rigs |
+| Official doc | https://help.aliyun.com/zh/document_detail/2667835.html |
+
+Tree:
+
+```
+vendor/DingRTC_Windows_SDK_3_9_0/
+├── api/             # 11 C++ headers (-I 用)
+│   ├── engine_interface.h            (93 KB, 主入口 API)
+│   ├── engine_types.h                (54 KB, 类型/枚举/结构体)
+│   ├── engine_audio_mixing_manager.h ( 8 KB)
+│   ├── engine_device_manager.h       (20 KB)
+│   ├── engine_rtm.h                  (16 KB)
+│   ├── engine_subtitle_manager.h     ( 4 KB)
+│   ├── engine_utils.h                ( 2 KB)
+│   ├── engine_wb_interface.h         (28 KB, whiteboard - 不用)
+│   ├── engine_wb_types.h             (14 KB, whiteboard - 不用)
+│   ├── engine_conf.h                 ( 1 KB)
+│   └── README
+├── lib/
+│   ├── x64/                          # ← Windows binding 用这个（Python 3.12 x64 ABI 对齐）
+│   │   ├── DingRTC.lib   ( 90 KB)    # link-time import lib
+│   │   ├── DingRTC.dll   (27 MB)     # runtime, main SDK
+│   │   ├── ffmpeg.dll    (38 MB)     # runtime dep
+│   │   ├── libSR.dll     (9.4 MB)    # 语音识别 runtime dep
+│   │   ├── krt.dll       (158 KB)    # vendor runtime support
+│   │   ├── hbal_se.dll   (2.0 MB)    # SE (signal enhancement) runtime dep
+│   │   ├── libcrypto-1_1-x64.dll + libssl-1_1-x64.dll  # OpenSSL 1.1 runtime
+│   │   ├── mediafoundation_capture.dll                 # Win MF capture
+│   │   ├── DingBeauty.dll + MoziWhiteboard.dll + pdfium.dll  # 视频/白板/PDF 旁路功能，
+│   │   │                                                       不用但 vendor 默认带
+│   │   └── kashost.exe                                 # SDK 后台 helper 进程（按需）
+│   └── x86/             # 备用，不用（我们走 64-bit Python）
+└── model/
+    ├── dingseg.mnn        (582 KB)   # MNN model — 语音分段
+    └── hbal_se_v1.0.15.nn (1.6 MB)   # 神经网络 — 降噪
+```
+
+**`.gitignore` coverage**: `isales-telephony/.gitignore` already includes
+`vendor/DingRTC_*_SDK_*/` glob (`engine-rtc-dingrtc-migration/tasks.md` §1.6).
+The vendor dir is **outside** `isales-telephony/` so this is belt-and-suspenders
+— `~/codes/vendor/` is not inside any of the 7 sibling repos and is not git-managed.
+
+**Runtime DLL co-location (verify when building binding)**: the 10+ DLLs in
+`lib/x64/` are inter-dependent. When the pybind `.pyd` loads `DingRTC.dll`,
+Windows loader will look for `ffmpeg.dll` / `krt.dll` / `libSR.dll` / `hbal_se.dll`
+/ both `libcrypto-1_1-x64.dll` + `libssl-1_1-x64.dll` / `mediafoundation_capture.dll`
+either next to `.pyd`, on `PATH`, or via `SetDllDirectory` / `os.add_dll_directory`.
+Cloud Linux model uses `-rpath` + same-dir; Windows equivalent is to copy
+all `lib/x64/*.dll` next to the built `.pyd` (this is what
+`build.ps1` does for the existing ARTC binding — same pattern applies).
+**Open question**: whether `kashost.exe` is required at runtime or is a CLI helper
+— check vendor doc §"集成准备" / quickstart before §7.4 build.
+
+**Used by**: `deploy/edge/windows/pybind/dingrtc_pywrap/` (new in
+`engine-rtc-dingrtc-migration` §7; layout mirrors cloud's
+`isales-engine/deploy/cloud/pybind/dingrtc_pywrap/` rather than
+spec §7.1 字面的 `isales_telephony/audio_bridge/_dingrtc_pywrap_src/` —
+对齐既有 Windows ARTC binding 的 `deploy/edge/windows/pybind/` 布局，与 cloud §2.1
+layout deviation 同理由）.
+
+---
+
+## Aliyun ARTC SDK for Windows [LEGACY — superseded by DingRTC 3.9.0 on 2026-05-30]
+
+> **Status**: vendor binary + `aliyun_artc_pywrap.pyd` 还在 `vendor/aliyun-artc-windows/`
+> 与 `pybind/aliyun_artc_pywrap/`，**未删** —— 留作 DingRTC binding build 失败时的 fallback
+> 验证手段。`engine-rtc-dingrtc-migration` §7 完整 green（含 §7.11 旧 binding 清理）
+> 后整段移除（包括 vendor + binding 源 + 本节）。
+>
+> **根因**: ARTC SDK 是 ApsaraVideo Live 产品线，与 ECS AppId `o6dpsan9`
+> (DingRTC PaaS) 不互通，token 跨产品 fail with `ERR_JOIN_BAD_TOKEN 0x02010205`.
+> 详见 `engine-rtc-dingrtc-migration/proposal.md`.
 
 Location: `deploy/edge/windows/vendor/aliyun-artc-windows/`.
 
@@ -97,7 +188,13 @@ defensive check without practical risk. Do **NOT** re-enable
 `/permissive-` without first patching the vendor header or convincing
 Aliyun to ship a newer toolchain build.
 
-## pybind11 binding build (`aliyun_artc_pywrap`)
+## pybind11 binding build (`aliyun_artc_pywrap`) [LEGACY — superseded by `dingrtc_pywrap`]
+
+> **Status**: 旧 binding 已 build (`.pyd` 在 `pybind/aliyun_artc_pywrap/`)，import smoke
+> 实测 12 个符号（多出 6 个后期 enum，比 STATE.md 原写"6 expected"漂移）。**留着不删**，
+> 同 vendor [LEGACY] 节理由 — 新 DingRTC binding 验证完整 green 前不删。
+> `engine-rtc-dingrtc-migration` §7.11 时一并清理（含本节 + `pybind/aliyun_artc_pywrap/`
+> + build artifacts）。新的 DingRTC binding 章节将在 §7 build 出 `.pyd` 时新增。
 
 Source: `isales-telephony/deploy/edge/windows/pybind/aliyun_artc_pywrap/`
 
