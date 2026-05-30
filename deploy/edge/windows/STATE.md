@@ -188,6 +188,79 @@ defensive check without practical risk. Do **NOT** re-enable
 `/permissive-` without first patching the vendor header or convincing
 Aliyun to ship a newer toolchain build.
 
+## pybind11 binding build (`dingrtc_pywrap`)  ← active
+
+Source: `isales-telephony/deploy/edge/windows/pybind/dingrtc_pywrap/`
+(8 files, 1049 lines; fork of `isales-engine/deploy/cloud/pybind/dingrtc_pywrap/`
+from `origin/dingrtc-migration-cloud`; CMake Linux→Windows retarget per §7.2).
+
+| File | Purpose |
+|---|---|
+| `CMakeLists.txt` | `find_package(Python3 3.12 EXACT REQUIRED)`; pybind11 via `python -m pybind11 --cmakedir` (no submodule); imports `DingRTC.lib` + `DingRTC.dll` from `$USERPROFILE/codes/vendor/DingRTC_Windows_SDK_3_9_0/lib/x64/`; env override `ISALES_DINGRTC_WINDOWS_SDK_PATH` |
+| `src/bindings.cpp` | Exposes `EngineHandle` SDK wrapper + 8 supporting types (unchanged from cloud) |
+| `src/audio_observer.cpp` + `.h` | `AudioObserver : public IRtcEngineAudioFrameObserver` — pushes inbound PCM → `FrameRingBuffer` |
+| `src/engine_listener.cpp` + `.h` | `EngineListener : public IRtcEngineEventListener` — 3 setter-injected Python callbacks (join / leave / error) |
+| `src/ring_buffer.cpp` + `.h` | `FrameRingBuffer` — mutex-protected MPSC, drop-oldest on overflow |
+
+**Build environment**:
+- `.venv-3.12` 新加 dep: `pybind11==3.0.4` (`pip install pybind11` 2026-05-30)
+- Output `.pyd`: `build/dingrtc-binding/Release/dingrtc_pywrap.cp312-win_amd64.pyd`
+
+Manual build invocation:
+
+```powershell
+$tel = "C:\Users\tianx\codes\isales-telephony"
+$env:Path = "C:\Program Files\CMake\bin;" + $env:Path
+$py = "$tel\.venv-3.12\Scripts\python.exe"
+$pybindDir = "$tel\deploy\edge\windows\pybind\dingrtc_pywrap"
+$buildDir = "$tel\build\dingrtc-binding"
+
+cmake -S $pybindDir -B $buildDir `
+    "-DPython3_EXECUTABLE=$py" "-DCMAKE_BUILD_TYPE=Release"
+cmake --build $buildDir --config Release --target dingrtc_pywrap
+```
+
+**Build + import + JOIN smoke 实测 GREEN (2026-05-30)**:
+
+- CMake configure 5.4s; cmake --build 零 warnings (DingRTC vendor 头 MSVC-clean,
+  与 ARTC vendor 头 C7626 anonymous typedef 不同; `/permissive-` 未来可补)
+- 9 exported symbols: `AudioObserver` / `DingRtcError` / `EngineHandle` /
+  `EngineListener` / `FrameRingBuffer` / `PcmFrame` / `POSITION_PLAYBACK` /
+  `POSITION_REMOTE_USER` / `set_log_dir_path`
+- Vendor demo path JOIN PASS via `scripts/windows_dingrtc_smoke.py`:
+  - `OnJoinChannelResult: rc=0 (0x00000000)` channel=`win-smoke-1780112455`
+    elapsed=500ms
+  - SDK 内部日志: `[API] JoinChannel (appid=a4zfr1hn, channel=..., userid=win-smoke, gslb=https://gslb.dingrtc.com, ...)`
+  - 5s 持续 + clean leave + destroy 无错
+  - Token 来自 vendor `onertc-demo-app-server.dingtalk.com/login` (server-issued,
+    无客户端 AppKey 参与; design.md §1.5 ENV path 已被 §4.2 ground-truth retire,
+    与 mac smoke `fetch_demo_token` 同模式)
+
+Smoke 命令:
+
+```powershell
+.\.venv-3.12\Scripts\python.exe scripts\windows_dingrtc_smoke.py
+# 默认 demo path; 5s duration; PASS exit 0
+# --real 走 ISALES_RTC_APP_ID + ISALES_RTC_APP_KEY 自签 token (生产 AppId)
+```
+
+**Runtime DLL co-location (next-to-pyd or add_dll_directory)**: smoke script
+通过 `os.add_dll_directory(vendor/lib/x64)` 加 DLL 搜索路径; build.ps1 frozen-exe
+路径需要把 `lib/x64/*.dll` (DingRTC + ffmpeg + libSR + krt + hbal_se + crypto
++ ssl + mediafoundation_capture + DingBeauty/MoziWhiteboard/pdfium) 复制到 .pyd
+同目录. `kashost.exe` 实测 demo join 5s 周期未需要 spawn (vendor 文档待查
+确认是否仅按需 launch), 当前不打 bundle.
+
+Still to do (§7.5+):
+- §7.6 高层 `DingRtcSession` Python 包装类 (mirror cloud
+  `isales_engine.transport.dingrtc._session.DingRtcSession`)
+- §7.7 push_audio + drain_inbound_frames 实测 (`set_external_audio_source`
+  已 wire, 但 smoke script 没跑 PCM uplink)
+- §7.8 dual-peer e2e (Windows + ECS 同 channel)
+- §7.9 build.ps1 集成 + DLL co-location
+- §7.10 PyInstaller frozen-exe smoke
+- §7.11 ARTC binding + vendor 清理
+
 ## pybind11 binding build (`aliyun_artc_pywrap`) [LEGACY — superseded by `dingrtc_pywrap`]
 
 > **Status**: 旧 binding 已 build (`.pyd` 在 `pybind/aliyun_artc_pywrap/`)，import smoke
