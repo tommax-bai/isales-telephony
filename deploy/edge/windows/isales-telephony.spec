@@ -19,10 +19,14 @@
 # - Console window: Hidden via `console=False`. The activation dialog +
 #   tray are the only user-visible surface; stdout/stderr go to the
 #   logging.FileHandler installed by main_windows.py.
-# - ARTC SDK DLLs: drop the Aliyun ARTC-for-Windows native bundle under
-#   `vendor/aliyun-artc-windows/` next to the spec before building. The
-#   `binaries` glob below picks them up; the `hiddenimports` line ensures
-#   the Python wrapper module name PyInstaller might miss is included.
+# - RTC SDK DLLs + pybind11 binding: § 7.11 (engine-rtc-dingrtc-migration)
+#   removed the ARTC SDK + aliyun_artc_pywrap path. § 7.9 (TODO) will wire
+#   DingRTC: collect `~/codes/vendor/DingRTC_Windows_SDK_3_9_0/lib/x64/*.dll`
+#   (12 DLLs incl. DingRTC.dll, ffmpeg, libSR, krt, hbal_se, libcrypto,
+#   libssl, mediafoundation_capture) + dingrtc_pywrap.cp312-win_amd64.pyd
+#   from build/dingrtc-binding/Release/ and add to `binaries` + add
+#   "dingrtc_pywrap" hidden import. Current build produces RTC-less smoke
+#   binary (modem + AT + cloud-edge gRPC work; RTC import fails).
 # - Tray icon: `icons/tray.ico` ships as a `datas` entry; main_windows.py
 #   reads it via sys._MEIPASS-aware path.
 
@@ -30,38 +34,27 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# ARTC SDK Windows native — operator-supplied. Glob over the vendor dir
-# (recursively, since v7.6.0 puts DLLs under x64/Release/) and also pick
-# up the project-local pybind11 binding .pyd from pybind/. PyInstaller
-# silently no-ops missing globs, so CI builds without ARTC still produce
-# a smoke-test binary that fails at RTC import — acceptable.
-artc_binaries = []
 import glob
 import os
 
+# RTC vendor DLLs + pybind11 binding .pyd: removed § 7.11 with the ARTC SDK.
+# § 7.9 (TODO engine-rtc-dingrtc-migration) will collect from
+# ~/codes/vendor/DingRTC_Windows_SDK_3_9_0/lib/x64/*.dll + build/dingrtc-
+# binding/Release/dingrtc_pywrap.cp312-win_amd64.pyd; until then `rtc_binaries`
+# stays empty so PyInstaller produces a smoke binary (modem/AT/gRPC work,
+# RTC import will fail at runtime).
+rtc_binaries = []
+
 _HERE = os.path.dirname(os.path.abspath(SPEC))
-_VENDOR_DIR = os.path.join(_HERE, "vendor", "aliyun-artc-windows")
-if os.path.isdir(_VENDOR_DIR):
-    for dll in glob.glob(os.path.join(_VENDOR_DIR, "**", "*.dll"), recursive=True):
-        # (source, destination) — pack into the runtime root so
-        # ctypes.CDLL(name) finds it without explicit PATH magic.
-        artc_binaries.append((dll, "."))
 
-# Project-local pybind11 binding — built by build.ps1's CMake step.
-# See openspec/changes/windows-artc-pybind11/.
-_PYBIND_DIR = os.path.join(_HERE, "pybind", "aliyun_artc_pywrap")
-if os.path.isdir(_PYBIND_DIR):
-    for pyd in glob.glob(os.path.join(_PYBIND_DIR, "*.pyd")):
-        artc_binaries.append((pyd, "."))
-
-# VC Runtime — Aliyun's DLLs + the pybind11 binding both depend on
+# VC Runtime — DingRTC DLLs + future pybind11 binding both depend on
 # msvcp140 / vcruntime140; bundle them so users don't need VC Redist.
-# See openspec/changes/windows-artc-pybind11/design.md Decision 8.
+# Kept active because installer needs them regardless of RTC bundling state.
 _SYS32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 for vcrt_dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
     _src = os.path.join(_SYS32, vcrt_dll)
     if os.path.exists(_src):
-        artc_binaries.append((_src, "."))
+        rtc_binaries.append((_src, "."))
 
 _ICON_DIR = os.path.join(_HERE, "icons")
 _TRAY_ICO = os.path.join(_ICON_DIR, "tray.ico") if os.path.exists(
@@ -72,7 +65,7 @@ _TRAY_ICO = os.path.join(_ICON_DIR, "tray.ico") if os.path.exists(
 a = Analysis(
     ["..\\..\\..\\isales_telephony\\main_windows.py"],
     pathex=[],
-    binaries=artc_binaries,
+    binaries=rtc_binaries,
     datas=[
         (_ICON_DIR, "icons"),
         # env.example.txt ships at the binary root for first-time setup.
@@ -94,11 +87,10 @@ a = Analysis(
         # (windows-client-core design.md Decision 3 amend 2026-05-17);
         # sounddevice / _cffi_backend hidden imports removed accordingly.
         # pyserial is already a main dependency and visible to PyInstaller.
-        # Project-local pybind11 binding for the ARTC Windows SDK. The
-        # .pyd ships via `binaries` glob; this hidden import ensures
-        # PyInstaller's depscan treats it as a module reference.
-        # See openspec/changes/windows-artc-pybind11/.
-        "aliyun_artc_pywrap",
+        # TODO § 7.9 (engine-rtc-dingrtc-migration): add "dingrtc_pywrap"
+        # hidden import once § 7.9 wires the .pyd into `binaries` above.
+        # Until then the entrypoint will fail at `import dingrtc_pywrap`
+        # but only on the RTC code path (modem/AT/gRPC paths unaffected).
         # grpcio runtime helpers PyInstaller sometimes misses.
         *collect_submodules("grpc"),
     ],

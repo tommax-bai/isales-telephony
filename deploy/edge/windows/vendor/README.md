@@ -1,74 +1,39 @@
 # Vendor binaries for the Windows edge client
 
-This directory holds proprietary third-party SDKs that the iSales
-Windows edge client links against. Contents are **gitignored** — the
-operator drops the unpacked SDK here before running
-`deploy/edge/windows/build.ps1`.
+This directory is **empty** post-`engine-rtc-dingrtc-migration` § 7.11
+(2026-05-30) — RTC SDK and pybind11 binding both moved out of the repo:
 
-## Aliyun ARTC SDK for Windows
+| Asset | Where it lives now |
+|---|---|
+| DingRTC Windows SDK 3.9.0 (`DingRTC.dll`, 11 deps DLLs, headers, models) | `~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (cross-repo shared, gitignored, **outside** this repo). Symmetric with mac (`~/codes/vendor/DingRTC_macOS_SDK_3_9_0/`) + cloud Linux (`/opt/isales/vendor/DingRTC_Linux_SDK_3_9_0/`) per `engine-rtc-dingrtc-migration/design.md` D9. |
+| pybind11 binding source | `deploy/edge/windows/pybind/dingrtc_pywrap/` (in repo) |
+| pybind11 binding .pyd output | `build/dingrtc-binding/Release/dingrtc_pywrap.cp312-win_amd64.pyd` (gitignored build artifact) |
 
-**Expected layout** (after `Expand-Archive` of the official zip):
+**Setup recipe**: download + extract the SDK zip:
 
-```
-aliyun-artc-windows/
-├── include/                     # C++ headers (rtc/, player/, pusher/)
-│   ├── alivc_live_define.h
-│   ├── alivc_live_listener.h
-│   ├── alivc_live_utils.h
-│   ├── rtc/
-│   │   ├── engine_define.h
-│   │   ├── engine_device_manager.h
-│   │   ├── engine_interface.h         # 299 KB — main AliEngine + EventListener
-│   │   ├── engine_media_engine.h      # IAudioFrameObserver, AliEngineAudioRawData
-│   │   └── engine_utils.h
-│   ├── player/...
-│   └── pusher/...
-└── x64/Release/                 # 64-bit binaries (~35 MB total)
-    ├── AliRTCSdk.dll            # 22 MB — RTC main DLL
-    ├── AliRTCSdk.lib            # 0.2 MB — link library
-    ├── alivcffmpeg.dll          # 3.7 MB
-    ├── alivcx265.dll            # 5.9 MB — H.265 (not used by audio path, runtime needs it)
-    ├── PluginAAC.dll            # 1.2 MB
-    └── x264.dll                 # 2.4 MB
+```powershell
+# One-time per Windows dev rig.
+$VendorRoot = "$env:USERPROFILE\codes\vendor"
+New-Item -ItemType Directory -Force -Path $VendorRoot | Out-Null
+$Zip = "$VendorRoot\.download\DingRTC_Windows_SDK_3_9_0.zip"
+$Url = "https://dingrtc.oss-cn-zhangjiakou.aliyuncs.com/sdk/windows/3.9.0/DingRTC_Windows_SDK_3_9_0.zip"
+Invoke-WebRequest -Uri $Url -OutFile $Zip
+Expand-Archive -Path $Zip -DestinationPath $VendorRoot -Force
+# Verify: sha256 must match F594...19974 — see isales-telephony/deploy/edge/windows/STATE.md § DingRTC SDK
+Get-FileHash -Algorithm SHA256 $Zip
 ```
 
-**Source**: official zip from Aliyun CDN
-`https://alivc-demo-cms.alicdn.com/versionProduct/sdk/rtc/windows/AliVCSDK_ARTC-7.6.0.zip`
-(v7.6.0, dated 2025-09-02), linked from
-[阿里云 ARTC SDK 下载页](https://help.aliyun.com/zh/live/artc-download-the-sdk).
+**Why outside this repo?** vendor SDK is large (~48 MB zip, ~140 MB
+extracted) and shared across smoke / dev / build sessions; keeping it
+under `~/codes/vendor/` (a cross-repo well-known location) lets one
+download serve every iSales repo that needs it (`isales-engine` cloud
+binding builds against the same SDK family on Linux).
 
-**Drop `.pdb` debug symbols** before committing/packaging — `*.pdb`
-files inflate the SDK to ~170 MB and aren't needed at runtime.
+**§ 7.9 next step**: `build.ps1` will read this vendor location +
+`isales-telephony.spec` will collect `lib/x64/*.dll` for the frozen exe.
+Until § 7.9 is implemented, `build.ps1` skips the pybind build (smoke
+binary, no RTC), and ad-hoc cmake invocation (see STATE.md
+"Manual build invocation") produces the working `.pyd` directly.
 
-## Important caveat: no official Python wrapper for Windows
-
-Unlike the **Linux** ARTC SDK (which ships an official Python wrapper —
-see `isales-engine/transport/_rtc_sdk.py`), the **Windows** SDK is
-**C++ only** (headers + `.lib` + `.dll`). The iSales Windows edge
-client therefore needs a project-local pybind11 binding to call into
-the RTC engine.
-
-That binding lives under
-`deploy/edge/windows/pybind/aliyun_artc_pywrap/` and produces
-`aliyun_artc_pywrap.pyd` — packaged into the PyInstaller frozen exe
-alongside the ARTC DLLs.
-
-**Implementation status (2026-05-17)**: implemented. The binding sources
-`bindings.cpp` / `audio_observer.{h,cpp}` / `engine_listener.{h,cpp}` /
-`ring_buffer.{h,cpp}` live in `pybind/aliyun_artc_pywrap/src/`. CMake
-build is wired into `deploy/edge/windows/build.ps1` before PyInstaller
-runs. The OpenSpec change `openspec/changes/windows-artc-pybind11/`
-captures the design (pybind11 + CMake / GIL strategy / lifecycle).
-See also the `reference-artc-sdk` memory note for the Linux-vs-Windows
-SDK shape discrepancy that originally drove this work.
-
-## What `build.ps1` expects to find here
-
-The PyInstaller spec (`deploy/edge/windows/isales-telephony.spec`)
-globs `**/*.dll` recursively from `vendor/aliyun-artc-windows/` (the
-v7.6.0 zip puts them under `x64/Release/`) and globs `*.pyd` from
-`pybind/aliyun_artc_pywrap/` (the CMake build output, see build.ps1
-step 4). If `vendor/` is empty the build still succeeds, but
-`build.ps1` skips the CMake step and the resulting frozen exe will
-fail at `import aliyun_artc_pywrap` — useful for catching wire-up
-bugs without needing the SDK in CI.
+For the binding source / smoke / state-of-the-build snapshot, see
+[`../STATE.md` § DingRTC binding](../STATE.md).

@@ -173,20 +173,36 @@ Visual Studio Build Tools 2022 (C++ workload) and CMake 3.20+ installed:
 ```powershell
 # From the isales-telephony repo root, on Windows.
 
-# First-time: check out the pybind11 submodule used by aliyun_artc_pywrap.
-git submodule update --init --recursive
-
-# Drop the Aliyun ARTC SDK for Windows v7.6.0 zip into
-# deploy/edge/windows/vendor/aliyun-artc-windows/ before building.
-# See vendor/README.md for the download URL.
+# First-time: drop DingRTC Windows SDK 3.9.0 into the cross-repo vendor
+# location (~/codes/vendor/DingRTC_Windows_SDK_3_9_0/) — see
+# deploy/edge/windows/vendor/README.md for the download URL + sha256.
 
 powershell -ExecutionPolicy Bypass -File deploy\edge\windows\build.ps1
 ```
 
 Outputs `dist/isales-telephony/` (onedir form) and a timestamped zip.
-`build.ps1` runs CMake to produce the `aliyun_artc_pywrap.pyd` pybind11
-binding (see `deploy/edge/windows/pybind/aliyun_artc_pywrap/README.md`
-and `openspec/changes/windows-artc-pybind11/`) before PyInstaller
-packages everything together. Without the vendor SDK present the CMake
-step is skipped — the resulting exe is a smoke-test binary that will
-fail at `import aliyun_artc_pywrap`.
+The Windows RTC layer uses **DingRTC** 3.9.0 via a project-internal
+pybind11 binding (`deploy/edge/windows/pybind/dingrtc_pywrap/`, mirror
+of the Linux cloud binding). Build it directly with cmake:
+
+```powershell
+$tel = "C:\Users\tianx\codes\isales-telephony"
+$env:Path = "C:\Program Files\CMake\bin;" + $env:Path
+$py = "$tel\.venv-3.12\Scripts\python.exe"
+cmake -S "$tel\deploy\edge\windows\pybind\dingrtc_pywrap" `
+    -B "$tel\build\dingrtc-binding" `
+    "-DPython3_EXECUTABLE=$py" "-DCMAKE_BUILD_TYPE=Release"
+cmake --build "$tel\build\dingrtc-binding" --config Release
+```
+
+See `deploy/edge/windows/STATE.md` § DingRTC binding for the canonical
+build recipe, the runtime DLL co-location strategy, and the dual-peer
+e2e smoke that proves the binding works end-to-end against the Aliyun
+ECS cloud engine. `build.ps1` integration of the pybind build is
+**TODO §7.9** of `engine-rtc-dingrtc-migration`; until then, the
+PyInstaller output is a smoke binary (modem + AT + cloud-edge gRPC
+work; `import dingrtc_pywrap` fails at runtime unless the .pyd is
+manually copied next to the frozen exe). The old ARTC SDK + binding
+were removed in § 7.11 (2026-05-30) — the ECS AppId is a DingRTC PaaS
+AppId, not an ApsaraVideo Live ARTC one, so the prior Windows binding
+was structurally wrong.

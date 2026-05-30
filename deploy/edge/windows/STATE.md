@@ -1,13 +1,18 @@
 # Windows edge dev rig — current state snapshot
 
 **Last updated**: 2026-05-30 — DingRTC Windows SDK 3.9.0 vendored at
-`~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 matches mac end-of-tasks.md §1.3);
-ARTC SDK + `aliyun_artc_pywrap.pyd` retained but **superseded** — see § "DingRTC
-SDK for Windows" below; `aliyun-artc-windows/` + `aliyun_artc_pywrap/` to be
-removed after Windows `dingrtc_pywrap` binding builds green + join smoke passes
-(`engine-rtc-dingrtc-migration` §7). Toolchain (Python 3.12 + CMake + VS BuildTools)
-unchanged; SIM7600G-H modem on COM12 (AT) / COM11 (audio); cloud-edge gRPC smoke
-to ECS green.
+`~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 `F594...19974`
+matches mac/ECS); `dingrtc_pywrap` binding built + import + JOIN smoke
++ push/drain + Windows↔ECS dual-peer e2e all GREEN (`engine-rtc-dingrtc-
+migration` §7.1-7.8). § 7.11 (this commit) physically removed
+`vendor/aliyun-artc-windows/` + `pybind/aliyun_artc_pywrap/` +
+`audio_bridge/windows_rtc_session.py` + ARTC tests/scripts;
+`audio_bridge.get_default_rtc_session_factory(app_id=...)` now routes
+Windows to `WindowsDingRtcSession`. § 7.9 (`build.ps1` integration +
+PyInstaller DLL co-location) + § 7.10 (frozen-exe smoke) are the only
+remaining § 7 subtasks. Toolchain (Python 3.12 + CMake + VS BuildTools)
+unchanged; SIM7600G-H modem on COM12 (AT) / COM11 (audio); cloud-edge
+gRPC smoke to ECS green.
 
 This file is the Windows-dev-rig sibling of
 `isales/deploy/cloud/STATE.md`. It records the state of the **build
@@ -141,53 +146,6 @@ all `lib/x64/*.dll` next to the built `.pyd` (this is what
 spec §7.1 字面的 `isales_telephony/audio_bridge/_dingrtc_pywrap_src/` —
 对齐既有 Windows ARTC binding 的 `deploy/edge/windows/pybind/` 布局，与 cloud §2.1
 layout deviation 同理由）.
-
----
-
-## Aliyun ARTC SDK for Windows [LEGACY — superseded by DingRTC 3.9.0 on 2026-05-30]
-
-> **Status**: vendor binary + `aliyun_artc_pywrap.pyd` 还在 `vendor/aliyun-artc-windows/`
-> 与 `pybind/aliyun_artc_pywrap/`，**未删** —— 留作 DingRTC binding build 失败时的 fallback
-> 验证手段。`engine-rtc-dingrtc-migration` §7 完整 green（含 §7.11 旧 binding 清理）
-> 后整段移除（包括 vendor + binding 源 + 本节）。
->
-> **根因**: ARTC SDK 是 ApsaraVideo Live 产品线，与 ECS AppId `o6dpsan9`
-> (DingRTC PaaS) 不互通，token 跨产品 fail with `ERR_JOIN_BAD_TOKEN 0x02010205`.
-> 详见 `engine-rtc-dingrtc-migration/proposal.md`.
-
-Location: `deploy/edge/windows/vendor/aliyun-artc-windows/`.
-
-```
-vendor/aliyun-artc-windows/
-├── include/          # 头文件（编译时 -I）
-│   └── rtc/
-│       ├── engine_device_manager.h    # 含 C7626 触发点 line 51 (typedef struct with member init)
-│       └── ... (其余 ARTC C++ headers)
-└── x64/
-    └── Release/
-        ├── AliRTCSdk.lib        # link-time import lib for .pyd
-        ├── AliRTCSdk.dll        (21.7 MB)  ← runtime dependency
-        ├── alivcffmpeg.dll      (3.7 MB)
-        ├── alivcx265.dll        (5.8 MB)
-        ├── PluginAAC.dll        (1.2 MB)
-        └── x264.dll             (2.4 MB)
-```
-
-Vendor source: `https://alivc-demo-cms.alicdn.com/versionProduct/sdk/rtc/windows/AliVCSDK_ARTC-7.6.0.zip`
-(per `vendor/README.md`). 7.6.0 is the current pinned version; Aliyun's
-desktop SDK release cadence is slow (Android / iOS at 7.11.0+).
-
-**MSVC 19.44 + `/permissive-` regression**: vendor header
-`engine_device_manager.h:51` uses `typedef struct { int width = 0; ... }
-AliEngineVideoResolution;` (anonymous typedef with in-class member
-initializers), valid under MS extensions but rejected by C7626 under
-strict conformance. `CMakeLists.txt` for the pybind binding dropped
-`/permissive-` 2026-05-17 (commit `b9cd5de`); our 4 binding `.cpp` files
-are C++17-conformant by design so losing `/permissive-` removes a
-defensive check without practical risk. Do **NOT** re-enable
-`/permissive-` without first patching the vendor header or convincing
-Aliyun to ship a newer toolchain build.
-
 ## pybind11 binding build (`dingrtc_pywrap`)  ← active
 
 Source: `isales-telephony/deploy/edge/windows/pybind/dingrtc_pywrap/`
@@ -299,78 +257,6 @@ Still to do (§7.9+):
   WindowsDingRtcSession 默认 (currently 路由仍指 WindowsRtcSession,
   breaking-change 留 §7.8 已 green, 路由可在 §7.11 一并切)
 
-## pybind11 binding build (`aliyun_artc_pywrap`) [LEGACY — superseded by `dingrtc_pywrap`]
-
-> **Status**: 旧 binding 已 build (`.pyd` 在 `pybind/aliyun_artc_pywrap/`)，import smoke
-> 实测 12 个符号（多出 6 个后期 enum，比 STATE.md 原写"6 expected"漂移）。**留着不删**，
-> 同 vendor [LEGACY] 节理由 — 新 DingRTC binding 验证完整 green 前不删。
-> `engine-rtc-dingrtc-migration` §7.11 时一并清理（含本节 + `pybind/aliyun_artc_pywrap/`
-> + build artifacts）。新的 DingRTC binding 章节将在 §7 build 出 `.pyd` 时新增。
-
-Source: `isales-telephony/deploy/edge/windows/pybind/aliyun_artc_pywrap/`
-
-| File | Purpose |
-|---|---|
-| `CMakeLists.txt` | CMake project; `find_package(Python3 3.12 EXACT REQUIRED)`; `pybind11_add_module(aliyun_artc_pywrap MODULE src/*.cpp)` |
-| `src/bindings.cpp` | Exposes `EngineHandle` class (SDK wrapper) + 5 pybind11 types |
-| `src/audio_observer.cpp` + `.h` | `AudioObserver : public IAudioFrameObserver` — pushes inbound PCM frames to `FrameRingBuffer` |
-| `src/engine_listener.cpp` + `.h` | `EngineListener : public AliEngineEventListener` — 4 setter-injected Python callbacks (join / leave / network / connection-state) |
-| `src/ring_buffer.cpp` + `.h` | `FrameRingBuffer` — mutex-protected MPSC, drop-oldest on overflow |
-| `deps/pybind11/` | git submodule, pybind11 v3.0.4 (stable; compatible with our v2.11+ requirement) |
-
-Build invocation (manual, bypassing `build.ps1`'s frozen-exe wrapper):
-
-```powershell
-$tel = "C:\Users\tianx\codes\isales-telephony"
-$env:Path = "C:\Program Files\CMake\bin;" + $env:Path
-$py = "$tel\.venv-3.12\Scripts\python.exe"
-$pybindDir = "$tel\deploy\edge\windows\pybind\aliyun_artc_pywrap"
-$buildDir = "$tel\build\pybind"
-
-cmake -S $pybindDir -B $buildDir `
-    "-DPython3_EXECUTABLE=$py" "-DCMAKE_BUILD_TYPE=Release"
-cmake --build $buildDir --config Release --target aliyun_artc_pywrap
-```
-
-Output: `build\pybind\Release\aliyun_artc_pywrap.cp312-win_amd64.pyd`
-(258 KB). The ABI-tag suffix `.cp312-win_amd64` is pybind11's default
-naming (Python import system accepts both bare and tagged form).
-`build.ps1` step 4d was fixed 2026-05-17 (commit `b9cd5de`) to glob
-`aliyun_artc_pywrap*.pyd` instead of the hardcoded bare name.
-
-Built .pyd in dev location: `deploy\edge\windows\pybind\aliyun_artc_pywrap\aliyun_artc_pywrap.cp312-win_amd64.pyd`.
-For runtime imports the 5 vendor DLLs must be on the DLL search path —
-`build.ps1` copies them next to the `.pyd` automatically; for ad-hoc
-dev imports run from the pybind dir.
-
-Import smoke (proves §9.2 — 6 expected symbols):
-
-```powershell
-cd C:\Users\tianx\codes\isales-telephony\deploy\edge\windows\pybind\aliyun_artc_pywrap
-& C:\Users\tianx\codes\isales-telephony\.venv-3.12\Scripts\python.exe -c `
-    "import sys; sys.path.insert(0, '.'); import aliyun_artc_pywrap as m; print(sorted(a for a in dir(m) if not a.startswith('_')))"
-# expect: ['AliyunArtcError', 'AudioObserver', 'EngineHandle', 'EngineListener', 'FrameRingBuffer', 'PcmFrame']
-```
-
-The 6 exported symbols match `windows-artc-pybind11/design.md` Decision 2
-verbatim — `AliyunArtcError` exception subclass + 5 pybind11 type
-wrappers (one `EngineHandle` SDK wrapper class + 4 supporting value /
-helper types).
-
-**Still to do** (pybind §9.3-§9.5):
-
-- §9.3 PyInstaller frozen-exe smoke: `build.ps1` step 5+ runs PyInstaller
-  bundling against the pybind output; needs a clean Windows PC (or a
-  fresh user account with no dev tools) to verify the frozen exe finds
-  all DLLs (incl. VC Runtime msvcp140 / vcruntime140 / vcruntime140_1)
-- §9.4 Real ARTC RTC join smoke: dev box uses `aliyun_artc_pywrap.EngineHandle`
-  + AppId/AppKey to join a test channel and confirm
-  `on_join_channel_result(code=0)` callback. **Needs an RTC client token
-  signed with AppKey**, which is in `engine.env::ISALES_RTC_APP_KEY` on
-  the ECS (not on dev box).
-- §9.5 PCM push/pull smoke: §9.4 + push silence PCM → ECS engine pulls
-  → reverse path; end-to-end delay P95 ≤ 50 ms.
-
 ## Hardware rig: SIMCom SIM7600G-H
 
 The dev box has one **SIMCom SIM7600G-H 4G LTE Cat 4 USB GSM modem**
@@ -451,17 +337,19 @@ cmake --version             # expect: cmake version 4.3.2 (require fresh PowerSh
 Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"
 # expect: True
 
-# 2. ARTC SDK Windows vendor + pybind .pyd built
+# 2. DingRTC SDK Windows vendor (cross-repo) + pybind .pyd built
 cd C:\Users\tianx\codes\isales-telephony
-Test-Path "deploy\edge\windows\vendor\aliyun-artc-windows\x64\Release\AliRTCSdk.lib"
-Test-Path "deploy\edge\windows\pybind\aliyun_artc_pywrap\aliyun_artc_pywrap.cp312-win_amd64.pyd"
-# expect: True / True
+Test-Path "$env:USERPROFILE\codes\vendor\DingRTC_Windows_SDK_3_9_0\lib\x64\DingRTC.lib"
+Test-Path "$env:USERPROFILE\codes\vendor\DingRTC_Windows_SDK_3_9_0\lib\x64\DingRTC.dll"
+Test-Path "build\dingrtc-binding\Release\dingrtc_pywrap.cp312-win_amd64.pyd"
+# expect: True / True / True
 
-# 3. pybind import smoke (6 expected symbols)
-cd deploy\edge\windows\pybind\aliyun_artc_pywrap
+# 3. pybind import smoke (9 expected symbols)
+$vendor = "$env:USERPROFILE\codes\vendor\DingRTC_Windows_SDK_3_9_0\lib\x64"
+$pyd = "C:\Users\tianx\codes\isales-telephony\build\dingrtc-binding\Release"
 & C:\Users\tianx\codes\isales-telephony\.venv-3.12\Scripts\python.exe -c `
-    "import sys; sys.path.insert(0, '.'); import aliyun_artc_pywrap as m; print(sorted(a for a in dir(m) if not a.startswith('_')))"
-# expect: ['AliyunArtcError', 'AudioObserver', 'EngineHandle', 'EngineListener', 'FrameRingBuffer', 'PcmFrame']
+    "import os, sys; os.add_dll_directory(r'$vendor'); sys.path.insert(0, r'$pyd'); import dingrtc_pywrap as m; print(sorted(a for a in dir(m) if not a.startswith('_')))"
+# expect: ['AudioObserver', 'DingRtcError', 'EngineHandle', 'EngineListener', 'FrameRingBuffer', 'PcmFrame', 'POSITION_PLAYBACK', 'POSITION_REMOTE_USER', 'set_log_dir_path']
 
 # 4. SIM7600G-H modem still on COM12 (AT) + COM11 (audio)
 & C:\Users\tianx\codes\isales-telephony\.venv\Scripts\python.exe -c `

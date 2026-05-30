@@ -1,4 +1,0 @@
-[submodule "deploy/edge/windows/pybind/aliyun_artc_pywrap/deps/pybind11"]
-	path = deploy/edge/windows/pybind/aliyun_artc_pywrap/deps/pybind11
-	url = https://github.com/pybind/pybind11.git
-	branch = stable

@@ -53,7 +53,7 @@ import os
 import signal
 import sys
 
-from isales_telephony.audio_bridge import get_default_rtc_session_class
+from isales_telephony.audio_bridge import get_default_rtc_session_factory
 from isales_telephony.edge.orchestrator import EdgeOrchestrator
 from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
@@ -196,7 +196,9 @@ async def _arun_real(args: argparse.Namespace) -> None:
         at_client=at_client,
         capture=capture,
         playback=playback,
-        rtc_session_factory=get_default_rtc_session_class(),
+        rtc_session_factory=get_default_rtc_session_factory(
+            app_id=os.environ.get("ISALES_RTC_APP_ID", ""),
+        ),
     )
 
     stop_event = asyncio.Event()
@@ -253,7 +255,9 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     orchestrator = EdgeOrchestrator(
         grpc_client=grpc_client,
-        rtc_session_factory=get_default_rtc_session_class(),
+        rtc_session_factory=get_default_rtc_session_factory(
+            app_id=os.environ.get("ISALES_RTC_APP_ID", ""),
+        ),
         dev_no_modem=True,
         dev_channel=args.dev_channel,
         dev_uid=args.dev_uid,

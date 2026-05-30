@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from isales_telephony.audio_bridge.bridge import AudioBridge
@@ -54,24 +55,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def get_default_rtc_session_class() -> type["RtcSession"]:
-    """Return the platform-appropriate :class:`RtcSession` implementation.
+def get_default_rtc_session_factory(
+    *, app_id: str | None = None,
+) -> Callable[[], "RtcSession"]:
+    """Return a zero-arg factory that constructs a platform-appropriate
+    :class:`RtcSession`.
 
-    - ``win32`` → :class:`WindowsRtcSession` (real ARTC via pybind11).
-    - ``darwin`` → :class:`MacosArtcPyObjCSession` (real ARTC via PyObjC
-      bridge, dev / QA) when the optional ``[macos-artc]`` extras +
-      ``AliRTCSdk.framework`` are present. Falls back to
-      :class:`MacosRtcSession` mock loopback when they are not (WARN
-      log + install hint).
+    The factory is invoked **without arguments** by ``EdgeOrchestrator``
+    (``self._rtc_factory()`` per call), so any session-construction kwargs
+    (such as Windows DingRTC ``app_id``) must be partial-bound here.
+
+    - ``win32`` → :class:`WindowsDingRtcSession` partial-bound to ``app_id``
+      (DingRTC via pybind11 from ``deploy/edge/windows/pybind/dingrtc_pywrap/``).
+      ``app_id`` is REQUIRED — DingRTC's RtcEngineAuthInfo bundles AppId at
+      construction time, not per-join.
+    - ``darwin`` → :class:`MacosArtcPyObjCSession` (PyObjC bridge, dev / QA)
+      when ``[macos-dingrtc]`` extras + ``DingRTC.framework`` are present.
+      Falls back to :class:`MacosRtcSession` mock loopback (WARN log + install
+      hint). ``app_id`` is unused on macOS — the Mac PyObjC class manages
+      its own DingRTC framework binding kwargs internally.
     - other → ``NotImplementedError``.
 
-    Both real bindings (Windows pybind11, macOS PyObjC) import lazily so
-    the rest of the package keeps importing cleanly on every platform
-    for tests.
+    Real bindings (Windows pybind11, macOS PyObjC) import lazily so the
+    rest of the package imports cleanly on every platform for tests.
     """
     if sys.platform == "win32":
-        from isales_telephony.audio_bridge.windows_rtc_session import WindowsRtcSession
-        return WindowsRtcSession
+        if not app_id:
+            raise ValueError(
+                "Windows edge RtcSession (DingRTC) requires app_id — set "
+                "ISALES_RTC_APP_ID env in the edge process before "
+                "constructing the factory."
+            )
+        from functools import partial
+        from isales_telephony.audio_bridge.windows_dingrtc_session import (
+            WindowsDingRtcSession,
+        )
+        return partial(WindowsDingRtcSession, app_id=app_id)
     if sys.platform == "darwin":
         try:
             from isales_telephony.audio_bridge.macos_artc_pyobjc import (
@@ -84,17 +103,17 @@ def get_default_rtc_session_class() -> type["RtcSession"]:
                 extra={
                     "detail": str(exc),
                     "hint": (
-                        "pip install -e '.[macos-artc]' and unzip "
-                        "AliRTCSdk_macos to ~/codes/vendor/AliRTCSdk_macos/ "
-                        "to enable real ARTC on macOS dev / QA"
+                        "pip install -e '.[macos-dingrtc]' and unzip "
+                        "DingRTC_macOS_SDK_3_9_0 to ~/codes/vendor/ "
+                        "to enable real DingRTC on macOS dev / QA"
                     ),
                 },
             )
             return MacosRtcSession
     raise NotImplementedError(
         f"No edge RtcSession implementation for platform {sys.platform!r}. "
-        "macOS走 PyObjC binding (fallback mock)，Windows 走 pybind11 binding；"
-        "Linux 边缘形态不支持 (v1.0)。"
+        "macOS走 PyObjC binding (fallback mock)，Windows 走 DingRTC "
+        "pybind11 binding；Linux 边缘形态不支持 (v1.0)。"
     )
 
 
@@ -104,5 +123,5 @@ __all__ = [
     "MacosRtcSessionConfig",
     "PcmRingBuffer",
     "Resampler",
-    "get_default_rtc_session_class",
+    "get_default_rtc_session_factory",
 ]

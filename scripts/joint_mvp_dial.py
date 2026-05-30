@@ -58,12 +58,17 @@ def run_ssh(*, ssh_host: str, ssh_key: str, remote_cmd: str, timeout: int = 30) 
 def step_preflight(args) -> None:
     """§7.1 — call out to §1 spot-check pieces."""
     print("[1/6] pre-flight ...", file=sys.stderr)
-    # ARTC pybind import
+    # DingRTC pybind import (§7 binding; ARTC pybind 已于 §7.11 删除).
     try:
-        import aliyun_artc_pywrap  # noqa: F401
+        import dingrtc_pywrap  # noqa: F401
     except ImportError as e:
-        sys.exit(f"  ✗ aliyun_artc_pywrap import: {e}")
-    print("  ✓ aliyun_artc_pywrap import", file=sys.stderr)
+        sys.exit(
+            f"  ✗ dingrtc_pywrap import: {e}\n"
+            "  Hint: build via cmake -S deploy/edge/windows/pybind/dingrtc_pywrap"
+            " -B build/dingrtc-binding -DPython3_EXECUTABLE=... (see "
+            "deploy/edge/windows/STATE.md § DingRTC binding)"
+        )
+    print("  ✓ dingrtc_pywrap import", file=sys.stderr)
 
     # cloud-edge gRPC smoke (subprocess)
     smoke = Path(__file__).resolve().parent / "cloud_edge_smoke.py"

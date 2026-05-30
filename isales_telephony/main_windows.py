@@ -228,7 +228,7 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         at_client=at_client,
         capture=capture,
         playback=playback,
-        rtc_session_factory=MacosRtcSession,  # D2 swaps in WindowsRtcSession
+        rtc_session_factory=MacosRtcSession,  # stub; D2 production swaps in WindowsDingRtcSession via audio_bridge.get_default_rtc_session_factory(app_id=...) — see edge/main.py
     )
 
     activation_controller = ActivationController(
