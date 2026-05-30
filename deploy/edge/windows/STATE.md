@@ -251,15 +251,29 @@ Smoke 命令:
 同目录. `kashost.exe` 实测 demo join 5s 周期未需要 spawn (vendor 文档待查
 确认是否仅按需 launch), 当前不打 bundle.
 
-Still to do (§7.5+):
-- §7.6 高层 `DingRtcSession` Python 包装类 (mirror cloud
-  `isales_engine.transport.dingrtc._session.DingRtcSession`)
-- §7.7 push_audio + drain_inbound_frames 实测 (`set_external_audio_source`
-  已 wire, 但 smoke script 没跑 PCM uplink)
-- §7.8 dual-peer e2e (Windows + ECS 同 channel)
+**§7.6 + §7.7 实测 GREEN (2026-05-30)** via
+`scripts/windows_dingrtc_session_smoke.py` (high-level
+`WindowsDingRtcSession` wrapper + push_audio + drain):
+
+- WindowsDingRtcSession constructed (app_id='a4zfr1hn',
+  gslb='https://gslb.dingrtc.com')
+- `await session.join(...)` wall_elapsed=453ms, is_joined=True ✓
+- `push_audio(silence, ts)` 2s × 16kHz mono int16 = 64000 bytes
+  全推完, 10ms 切片 + 8ms pace 工作正常
+- `audio_frames()` async generator drain 4s 拿到 **204 inbound
+  frames / 391680 bytes** (first_pcm_len=1920 = 960 samples = 60ms;
+  ≈ 50 fps SDK 帧率)
+- SDK 内部 log: `Uploader::OnStart` ×2 + `Uploader::OnProcess` ×N +
+  `Uploader::OnEnd` (上行管道完整)
+- `await session.leave()` clean + exit 0
+
+Still to do (§7.8+):
+- §7.8 dual-peer e2e (Windows + mac/ECS 同 channel 验真实 remote 音频)
 - §7.9 build.ps1 集成 + DLL co-location
 - §7.10 PyInstaller frozen-exe smoke
-- §7.11 ARTC binding + vendor 清理
+- §7.11 ARTC binding + vendor 清理 + `__init__.py` 路由切到
+  WindowsDingRtcSession 默认 (currently 路由仍指 WindowsRtcSession,
+  breaking-change 留 §7.8 e2e green 后一次性切)
 
 ## pybind11 binding build (`aliyun_artc_pywrap`) [LEGACY — superseded by `dingrtc_pywrap`]
 
