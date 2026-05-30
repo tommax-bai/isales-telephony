@@ -267,13 +267,37 @@ Smoke 命令:
   `Uploader::OnEnd` (上行管道完整)
 - `await session.leave()` clean + exit 0
 
-Still to do (§7.8+):
-- §7.8 dual-peer e2e (Windows + mac/ECS 同 channel 验真实 remote 音频)
+**§7.8 dual-peer e2e GREEN (2026-05-30)** — Windows ↔ ECS DingRTC 跨网音频互通实测:
+
+Setup:
+- channel: `dual-peer-win-1780115083`, app_id: `o6dpsan9` (prod), 90s TTL
+- Token mint via ECS `isales-engine-mint-rtc-token --user-id win-talker` (prod AppKey never leaves ECS)
+- `scripts/windows_dingrtc_session_smoke.py` 扩展 `--app-id` / `--token` / `--gslb` 接受外签 token (与 demo path mutually exclusive)
+- ECS listener: `ecs_pcm_loopback_listen.py --channel <same> --user-id ecs-listener --duration 25`
+
+Evidence (各自 RTC stats):
+
+| 端 | push | drain (inbound) | first frame | leave |
+|---|---|---|---|---|
+| Windows talker | 160 KB silence (5s @ 16kHz) | 404 frames / 775 KB | t+0s | clean exit 0 |
+| ECS listener | 143 frames silence | 2498 frames / 4.6 MB | t+0.0006s | `{"ok":true}` |
+
+意义:
+- Windows push 在 ECS inbound 总量中确证 (Windows→ECS 上行通)
+- ECS push 在 Windows drain 总量中确证 (ECS→Windows 下行通)
+- 跨大陆 (Windows 本地 ↔ 阿里云 121.89.85.150) 跨网 RTC 数据面完整工作
+
+ECS 端 `failed to open audio record/play device` 警告无害 — ECS 无声卡, external_audio_source +
+observer 路径不依赖物理设备, vendor SDK noise warnings only.
+
+13301035545 joint MVP gate **Windows §7 完整 GREEN**, RTC 数据面已不再阻塞.
+
+Still to do (§7.9+):
 - §7.9 build.ps1 集成 + DLL co-location
 - §7.10 PyInstaller frozen-exe smoke
 - §7.11 ARTC binding + vendor 清理 + `__init__.py` 路由切到
   WindowsDingRtcSession 默认 (currently 路由仍指 WindowsRtcSession,
-  breaking-change 留 §7.8 e2e green 后一次性切)
+  breaking-change 留 §7.8 已 green, 路由可在 §7.11 一并切)
 
 ## pybind11 binding build (`aliyun_artc_pywrap`) [LEGACY — superseded by `dingrtc_pywrap`]
 

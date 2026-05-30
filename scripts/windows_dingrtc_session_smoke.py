@@ -163,15 +163,29 @@ async def run(args: argparse.Namespace) -> int:
     channel = args.channel or f"win-sess-smoke-{int(time.time())}"
     user_id = args.user_id
 
-    token, gslbs = fetch_demo_token(channel, user_id)
-    gslb_server = gslbs[0] if gslbs else DEFAULT_GSLB
+    if args.app_id and args.token:
+        # Externally-supplied AppId + token (e.g. dual-peer §7.8: ECS
+        # `isales-engine-mint-rtc-token` -> token piped to this script).
+        app_id = args.app_id
+        token = args.token
+        gslb_server = args.gslb or DEFAULT_GSLB
+        print(
+            f"[1/5] external token path (app_id={app_id}, "
+            f"gslb={gslb_server}, token_len={len(token)})",
+            file=sys.stderr,
+        )
+    else:
+        # Vendor demo path.
+        app_id = DEMO_APPID
+        token, gslbs = fetch_demo_token(channel, user_id)
+        gslb_server = gslbs[0] if gslbs else DEFAULT_GSLB
 
     print(
         f"[2/5] constructing WindowsDingRtcSession "
-        f"(app_id={DEMO_APPID}, gslb={gslb_server})",
+        f"(app_id={app_id}, gslb={gslb_server})",
         file=sys.stderr,
     )
-    session = WindowsDingRtcSession(app_id=DEMO_APPID, gslb_server=gslb_server)
+    session = WindowsDingRtcSession(app_id=app_id, gslb_server=gslb_server)
 
     print(f"[3/5] join channel={channel!r} as uid={user_id!r} ...", file=sys.stderr)
     t0 = time.monotonic()
@@ -248,6 +262,18 @@ def main() -> None:
     ap.add_argument("--push-seconds", type=float, default=2.0, help="push silence duration (default: 2s)")
     ap.add_argument("--drain-seconds", type=float, default=3.0, help="drain duration (default: 3s)")
     ap.add_argument("--sample-rate", type=int, default=16000)
+    ap.add_argument(
+        "--app-id", default="",
+        help="DingRTC AppId (override demo path; pair with --token)",
+    )
+    ap.add_argument(
+        "--token", default="",
+        help="pre-minted RTC token (e.g. from ECS isales-engine-mint-rtc-token)",
+    )
+    ap.add_argument(
+        "--gslb", default="",
+        help="GSLB endpoint override (default https://gslb.dingrtc.com)",
+    )
     args = ap.parse_args()
     sys.exit(asyncio.run(run(args)))
 
