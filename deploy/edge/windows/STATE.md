@@ -24,6 +24,43 @@
 > - COM 号每次重插重排(认 description,`discover_modem_serial_paths()`);
 >   当前 AT=COM12 / AUDIO=COM11 / DIAG=COM10。
 
+## ⏭️ 会话交接 — 2026-05-31 收尾,明天续（可能换电脑,故记于此而非本机 memory）
+
+**结论(已坐实,别回头质疑):** "电话→AI 没通" 的 bug **锁定在
+`WindowsDingRtcSession.push_external_audio` → DingRTC 上行 publish → 引擎接收**
+这一段。证据:fake-WAV 注入(`ISALES_FAKE_CAPTURE_WAV` 绕开 modem 喂已知真人语音),
+`upstream_push` 一路推真语音、无 RtcError,**引擎仍只收静音**(call_record #98:
+`greeting→silence_activation×2→silence_max_reached`)。**不是 modem / 采集 /
+上行 pump / 重采样 / 驱动**(全已逐一排除)。详见下方 § "上行硬墙证伪 + 端点确证
++ 下行真凶定位" 的 "决定性定位" 段。
+
+**本会话提交(isales-telephony main,已 push):** `fd74cdf`(清过期误导结论)、
+`a374a7f`(测试操作手册+脚本清单+`_run_daemon_dev.py`)、`e29e43e`(fake-WAV 钩子
++ 锁定 bug)。
+
+**明天下一步(engine / DingRTC publish 侧 — edge 这边已查到头):**
+1. 云端 `isales-engine` 查 audio observer 收没收到 edge-<callid> 的帧:**收到**=
+   解码/VAD 问题;**没收到**=publish/subscribe 没接上。
+2. 对照云端 Linux `isales_engine/transport/dingrtc.py::DingRtcSession` 与边缘
+   `isales_telephony/audio_bridge/windows_dingrtc_session.py::join` 的 publish 配置链
+   (`enable_custom_audio_capture(True)`+`set_external_audio_source(True,16000,1)`+
+   `publish_local_audio_stream(True)`+`push_external_audio`)找差异——疑 Windows
+   binding 的外部音源没真接到已发布 RTP 流。
+3. 确认引擎 join 同信道 + `subscribe_all_remote_audio_streams`。
+4. **次要 bug**:引擎挂断后 edge 没收到挂断、空推 2.5min、modem 通话不挂(烧钱)——
+   查 gRPC `CallEvent(remote_hangup)` / RTC bye 的边缘传播。
+
+**怎么续(全栈真拨复跑):** 见下方 § "音频诊断脚本清单 + 全栈真拨测试操作手册"。
+要点速记:daemon 用 `.venv-3.12 python _run_daemon_dev.py`(`main_windows` 缺
+DingRTC DLL wiring,直接 `-m` 会崩);测前复位 `device 3→idle` + `lead 2→new`;
+campaign start 用 ECS heredoc 签 admin token(`$$` 在远程 `$(...)` 会被当 PID,
+必须 heredoc);测上行用 `ISALES_FAKE_CAPTURE_WAV=<8k mono wav>`,接电话不用说话。
+
+**换新电脑须先装好:** Python 3.12 + `.venv-3.12`(全运行依赖)+ DingRTC Windows
+SDK vendor + `dingrtc_pywrap` .pyd 构建 + SIM7600 驱动 + `isales-4.pem` —— 见本文
+下方各节 + § "Bootstrap a new dev session"。`downlink_8k.wav`(fake-WAV 源)是本机
+临时产物,新机需用 `capture_downlink.py` 真拨重采一段,或换任意 8k/mono/int16 语音 WAV。
+
 **Last updated**: 2026-05-30 — DingRTC Windows SDK 3.9.0 vendored at
 `~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 `F594...19974`
 matches mac/ECS); `dingrtc_pywrap` binding built + import + JOIN smoke
