@@ -1,10 +1,23 @@
 # Windows edge dev rig — current state snapshot
 
-> **2026-05-31 — SIM7600 USB 音频上行实测【可用】**(对端真人听到 tone)。
-> 之前一度的"Windows 写不进"是 **modem 音频 OUT 卡死态**,跨通话/跨
-> CPCMREG 清不掉,仅整机重启复位 —— **非 Windows / 非驱动版本限制**。详见
-> 下方 § "SIM7600 USB audio uplink — 实测可用"。重插后 COM 号重排为
-> AT=COM16 / AUDIO=COM17(认 description,不认数字)。
+> **2026-05-31(晚)— modem 上下行【两个方向都实测可用】;"电话到AI"真凶在
+> edge 上行链路,不在 modem / 不在驱动 / 不需要换 WinUSB。**
+> - ✅ 上行(AI→电话,主机写 COM11):对端真人听到 tone。
+> - ✅ 下行(电话→AI,主机读 COM11):读出干净 **8kHz** PCM,对端真人声 amp
+>   2000–3500、静音 ~10(`capture_downlink.py` 实测)。
+> - ❌ **仍未解的真 bug**:全栈真拨,引擎**全程只收到静音 → 因静音挂断**
+>   (call_record #96 transcript 实证:greeting 发出=下行通,之后全是
+>   `silence_activation`→`silence_max_reached`)。即 **modem 读得到对端声音,
+>   但送不进引擎**。断点在 edge 上行 `capture→push_audio→RTC publish` 或引擎
+>   订阅。头号嫌疑:`bridge.py::_upstream_loop` 的 `push_audio` 一抛 `RtcError`
+>   就被外层 `except` 接住→**整通上行 pump 退出**(下行照常)。
+> - **已被本轮证伪的旧结论(别再信):**(a)"写共享句柄→下行读塌到 640 B/s 的
+>   全双工硬墙"——`diag_duplex_collapse.py` 干净复测下行没塌;(b)"downlink
+>   ≈32KB/s 偏 16kHz"——实测 8kHz;(c)"出路 A 换 WinUSB/Zadig、出路 B 改
+>   Linux"——前提已塌,**Zadig 永久作废**(客户 PC 不可能换驱动)。
+> - 详见下方 § "上行硬墙证伪 + 端点确证 + 下行真凶定位 (2026-05-31 晚)"。
+> - COM 号每次重插重排(认 description,`discover_modem_serial_paths()`);
+>   当前 AT=COM12 / AUDIO=COM11 / DIAG=COM10。
 
 **Last updated**: 2026-05-30 — DingRTC Windows SDK 3.9.0 vendored at
 `~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 `F594...19974`
@@ -321,8 +334,9 @@ rtscts / dsrdtr+DTR-RTS / 单线程 lockstep 全 ok≈149、零 timeout;线状�
 overlapped WriteFile;③ **`AT+CFTRANRX` 灌大文件直接把整机 modem 搞挂**
 (所有 AT 口失联,软恢复全失效,只能物理重插)。
 
-**诊断旁证:** downlink 读音频口 ≈32KB/s 偏 16kHz,但 8K uplink 写对端能听到;
-模块自带 `C:` ~8.4MB/~1.8MB 可用(`AT+FSMEM`)。
+**诊断旁证:** downlink 读音频口 **= 16000 B/s = 8kHz**(2026-05-31 晚干净复测,
+`capture_downlink.py`;早先"≈32KB/s 偏16kHz"是卡死态/误测),8K uplink 写
+对端能听到;模块自带 `C:` ~8.4MB/~1.8MB 可用(`AT+FSMEM`)。
 
 **生产待办(→ OpenSpec change):**
 - `isales_telephony/modem_controller/audio/windows_serial_pcm.py` 当前
@@ -376,9 +390,13 @@ diag Phase D 实测单句柄并发读写可行)。`windows_serial_pcm.py` 的
 play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传坑
 见上文,如需重建按描述即可。
 
-## SIM7600 USB audio 全双工 — Windows 共享句柄硬墙 (2026-05-31)
+## ~~SIM7600 USB audio 全双工 — Windows 共享句柄硬墙~~（硬墙说已证伪，2026-05-31 晚）
 
-**真拨 13301035545 端到端实测里程碑 + 一堵硬墙。**
+> **⚠️ 本节标题里的"硬墙"结论已被推翻 —— 见下一节 § "上行硬墙证伪…"。**
+> 本节只保留两条仍成立的 ✅ 实测(AT 控制面修复 + 下行 AI 开场白通)作脉络;
+> ❌ 的"写就塌下行 / 只能 Zadig 或 Linux"已废。
+
+**真拨 13301035545 端到端实测里程碑(下半段"硬墙"已废)。**
 
 **✅ 已通(实测)：**
 - AT 控制面可靠性修复：`pyserial-asyncio` 在 Windows ProactorEventLoop 下间歇
@@ -389,30 +407,66 @@ play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传
   ("您好，我是智联招聘的小雨…")。modem 自动发现 + gRPC + 派发 + RTC join +
   下行音频全链路工作。
 
-**❌ 上行(对端 → AI)卡死 = 硬墙：**
-- 现象：引擎全程只收到静音(call_record transcript:`silence_activation` →
-  `hangup silence_max_reached`),即便边缘 capture+push 了 ~1.5MB。
-- 根因(穷尽验证)：**Windows 上对共享音频 COM 句柄(COM17)只要一写,下行读
-  就从 16320 B/s 塌到 640 B/s(1/25)并静音。** 纯读(不写)= 16320 B/s、对端
-  说话 amp~4000 清晰。试过的全部 read+write 写法**无一例外**:并发双线程 /
-  顺序读写 / 平衡 lockstep(读N写N)/ echo 参考精确模式(`timeout=0` 非阻塞
-  紧凑循环)。证据脚本:`read_farend_amp.py`(纯读 OK)、`read_amp_echo.py`
-  (全双工塌)。
-- 性质:**不是 pacing 问题**,是 Windows 串口独占句柄 + 这个 modem 的 USB
-  端点在一个句柄上做不了真全双工。能跑通的 `elementzonline/GSMModem`
-  echo 参考是 **Linux**(内核 option/qcserial 驱动栈不同)。
+**⚠️ 当初判的"上行硬墙"在干净 modem 上证伪(2026-05-31 晚,见下方新节)。**
+旧记录(保留作脉络):曾观察到引擎全程静音 + 怀疑"写共享句柄→下行读塌到
+640 B/s",据此推出 Zadig/改Linux 两条出路。**这两条出路及其前提均已作废**
+—— 真凶不在 modem 传输层,而在旧并发双线程 pump + 卡死态 + 旧 build 误用
+`MacosRtcSession`。下方新节用裸 modem 复现实测推翻了硬墙说。
 
-**➡️ 出路(未实现,下一轮):**
-- **A**:`pyusb` + WinUSB(Zadig 把 MI_04 从 COM 驱动换成 WinUSB)直接读写
-  音频接口的 **bulk IN / bulk OUT 两个独立端点** = 真全双工。**先决条件**:
-  确认 MI_04 是否有分开的 IN+OUT bulk 端点(USBView / pyusb enumerate);
-  若只有一个共享端点 → 该模块在 Windows 本质半双工,只能走 B。
-- **B**:边缘改 Linux(全双工已知可行)。
+## 上行"硬墙"证伪 + 端点确证 + 下行真凶定位 (2026-05-31 晚)
 
-**代码现状**:`audio_io.py::run_duplex_pump`(单任务全双工 pump 结构)+
-orchestrator Windows 分支已就位 —— pump 结构是对的,坏的是底层 COM 传输;
-未来 pyusb 后端可直接接这个 pump。`windows_serial_pcm.py::adopt_serial_from`
-(共享句柄)在全双工下证伪,pyusb 后端落地后应替换。
+**触发:** 用户报"AI→电话通了,电话→AI 没通",要求查 USB 接口端点 + 复测上下行。
+
+**1. MI_04 端点确证(pyusb 只读枚举,未换驱动):** 音频接口 MI_04 有
+**三个端点**:`0x88 BULK IN`(下行)、`0x05 BULK OUT`(上行)、`0x89 INTR IN`
+(串口通知)。**上下行是两根物理独立的 bulk 管子**,结构同 MI_01/02/03/05。
+工具:`enum_mi04_endpoints.py`(仓根)。
+→ **但这不构成换 WinUSB/Zadig 的理由:**(a) 一座位一台客户 PC,不可能让
+客户跑 Zadig 换驱动 + 换完 MI_04 不再是 COM 口、整条 pyserial 链路全废 ——
+**产品上是死路**;(b) 下面证明当前 usbser 驱动 + lockstep 已经够用,**根本
+不需要全双工换驱动**。Zadig 路线**永久作废**。
+
+**2. "写就塌下行"硬墙证伪:** `diag_duplex_collapse.py` 一通电话两段对比
+(对端全程说话):
+- P1 纯读 6s:16000 B/s,amp 1429–4707。
+- P2 读+**每帧写静音** 6s(完全复刻 `run_duplex_pump`):**13120–19200 B/s,
+  amp 1250–3347 —— 下行没塌。** 旧"塌到 640 B/s"未复现。
+→ 干净 modem + lockstep 顺序读写下,下行读**扛得住并发写**。硬墙是卡死态 +
+旧并发双线程 pump 的产物,不是物理极限。
+
+**3. 下行(电话→AI)真凶 = daemon 上层,非 modem:**
+- modem 层:`capture_downlink.py` 真拨实测,下行**稳定 8kHz、对端真人声
+  amp 2000–3500**(静音时 ~10)—— modem 读这层完全正常。
+- **引擎侧铁证(call_record #96,2026-05-31 22:03 真·全栈拨号):** transcript =
+  `greeting`(开场白发出=下行通)→ `silence_activation`×2 →
+  `hangup: silence_max_reached`。**引擎全程只收到静音**,即 modem 读得到的对端
+  声音**没送进引擎**。这坐实"电话→AI 不通"发生在 modem 之上的 edge 上行/RTC,
+  与 modem 无关。
+- edge 代码层:capture→upstream ring→`_up_resampler`(scipy resample_poly
+  8k→16k)→`push_audio`→DingRTC,整条 wiring 与重采样都对(代码读过,无明显 bug)。
+- **真凶候选(待新 edge 日志精确定位是哪一条):**
+  (a) 【头号】`bridge.py::_upstream_loop` line ~229 的 `except Exception` 兜底:
+  `push_audio` 抛 `RtcError`(DingRtcError,session.py:431)**不被内层 while
+  捕获** → 冒泡到这里 → 打一行 `audio_bridge_upstream_unexpected_error` →
+  **整个上行 pump 退出,这通剩下时间上行全死**(下行照常)→ 完美吻合
+  "AI→电话通 / 电话→AI 不通"。
+  (b) **旧 build 日志**(`%APPDATA%\isales\logs\telephony.log`):10:56 那次
+  join 的是 `MacosRtcSession`(旧 build 没接 factory,orchestrator 默认值),
+  根本没连真 DingRTC;且 `capture_pump_eof` 在 join 后 135ms 秒退。当前代码
+  `get_default_rtc_session_factory` win32 只返回 `WindowsDingRtcSession`(无
+  Macos fallback),此 bug 应已修 —— 但**日志混着旧 build,不能代表当前代码**。
+  (c) 11:21 最近一次:`cpcmreg_enable_failed` → 立刻挂断(但裸 `AT+CPCMREG=1`
+  当前手测 OK;疑似当时 modem 状态 / 时序)。
+
+**➡️ 决定性下一步:** 用**当前代码**全栈真拨一通(modem 已干净),抓新日志看
+三件事:① join 的是不是 `WindowsDingRtcSession`;② 有没有 `upstream_push n=...`
+(上行真推了)还是 `audio_bridge_upstream_unexpected_error`(pump 死了);
+③ 引擎侧收没收到。在此之前不要再据旧日志下结论。
+
+**诊断脚本(仓根):** `enum_mi04_endpoints.py`(端点枚举)、`capture_downlink.py`
+(下行采集+8k/16k WAV)、`diag_duplex_collapse.py`(P1纯读 vs P2读写对比)、
+`_probe_audio_cfg.py`(音频路由 AT 配置)。当前真机:AT=COM12/AUDIO=COM11/
+DIAG=COM10(认 description,重插必变)。
 
 ## Cloud-edge gRPC smoke (Windows → ECS, verified 2026-05-17 23:25 CST)
 
