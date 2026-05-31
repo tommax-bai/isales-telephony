@@ -48,12 +48,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import sys
 
 from isales_telephony.audio_bridge import get_default_rtc_session_factory
+from isales_telephony.edge.grpc_heartbeat import grpc_heartbeat_loop
 from isales_telephony.edge.orchestrator import EdgeOrchestrator
 from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
@@ -103,22 +105,28 @@ def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
             WindowsSerialPcmPlayback,
         )
 
-        # SerialPcm needs the modem's audio COM port path; on Windows the
-        # SIMCom-class modem exposes MI_04 as a Class=Ports sibling COM
-        # (typically "COMxx" with description containing "Audio"). D1
-        # PoC reads this from env; the full discovery wiring (USB watcher
-        # → identify_modem_channel → audio_serial_path) is post-D1 work
-        # noted in tasks.md §3 footer.
-        audio_path = os.environ.get("ISALES_MODEM_AUDIO_SERIAL_PATH")
-        if not audio_path:
-            raise RuntimeError(
-                "ISALES_MODEM_AUDIO_SERIAL_PATH is required for the windows "
-                "audio backend (e.g. 'COM11'); see deploy/edge/windows/env.example.txt"
-            )
-        return (
-            WindowsSerialPcmCapture(audio_path),
-            WindowsSerialPcmPlayback(audio_path),
+        from isales_telephony.modem_controller.platforms.windows_serial import (
+            ModemDiscoveryError,
+            discover_modem_serial_paths,
         )
+
+        # Auto-discover the audio COM port by USB descriptor (no env COM
+        # fallback — COM numbers re-enumerate every re-plug, so a hardcoded
+        # value is guaranteed stale). Capture (read) and playback (write)
+        # MUST share ONE handle on the Audio port: Windows COM ports are
+        # exclusive, and uplink to the Diagnostics port (COM10) was proven
+        # SILENT (2026-05-31). See deploy/edge/windows/STATE.md.
+        try:
+            _at_path, audio_path = discover_modem_serial_paths()
+        except ModemDiscoveryError as exc:
+            raise RuntimeError(
+                f"windows audio backend: modem auto-discovery failed: {exc}"
+            ) from exc
+        capture = WindowsSerialPcmCapture(audio_path)
+        playback = WindowsSerialPcmPlayback(audio_path)
+        capture.open_port()
+        playback.adopt_serial_from(capture)
+        return capture, playback
     raise RuntimeError(f"unknown ISALES_EDGE_AUDIO_BACKEND={backend!r}")
 
 
@@ -186,6 +194,12 @@ async def _arun_real(args: argparse.Namespace) -> None:
     endpoint = _required_env("ISALES_CLOUD_EDGE_ENDPOINT")
     token = _required_env("ISALES_EDGE_DEVICE_TOKEN")
 
+    # Device ID for gRPC heartbeat (PG device.id).
+    device_id_raw = os.environ.get("ISALES_DEVICE_ID", "")
+    device_id: int | None = int(device_id_raw) if device_id_raw.strip() else None
+    if not device_id:
+        logger.warning("ISALES_DEVICE_ID not set; gRPC heartbeat will be disabled")
+
     at_client = await _make_at_client()
     capture, playback = _build_audio_backends()
     event_buffer = _build_event_buffer()
@@ -202,6 +216,7 @@ async def _arun_real(args: argparse.Namespace) -> None:
     )
 
     stop_event = asyncio.Event()
+    heartbeat_task: asyncio.Task[None] | None = None
 
     def _request_stop() -> None:
         logger.info("edge_daemon_signal_received_stop")
@@ -217,6 +232,25 @@ async def _arun_real(args: argparse.Namespace) -> None:
     try:
         await grpc_client.start(endpoint=endpoint, token=token)
         await orchestrator.start()
+
+        # Start gRPC heartbeat loop to sync device status to cloud.
+        if device_id is not None:
+            from isales_common.proto import cloud_edge_pb2 as pb  # noqa: PLC0415
+
+            def _status_provider() -> int:
+                if orchestrator.active_call_ids:
+                    return int(pb.DEVICE_STATUS_IN_CALL)
+                return int(pb.DEVICE_STATUS_IDLE)
+
+            heartbeat_task = asyncio.create_task(
+                grpc_heartbeat_loop(
+                    client=grpc_client,
+                    device_id=device_id,
+                    status_provider=_status_provider,
+                ),
+                name="grpc_heartbeat",
+            )
+
         logger.info(
             "edge_daemon_started",
             extra={"endpoint": endpoint, "audio_backend": os.environ.get(
@@ -226,6 +260,10 @@ async def _arun_real(args: argparse.Namespace) -> None:
         await stop_event.wait()
     finally:
         logger.info("edge_daemon_stopping")
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         await orchestrator.stop()
         await grpc_client.stop()
         if event_buffer is not None:
@@ -252,6 +290,12 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     token = _required_env("ISALES_EDGE_DEVICE_TOKEN")
     event_buffer = _build_event_buffer()
 
+    # Device ID for gRPC heartbeat (PG device.id).
+    device_id_raw = os.environ.get("ISALES_DEVICE_ID", "")
+    device_id: int | None = int(device_id_raw) if device_id_raw.strip() else None
+    if not device_id:
+        logger.warning("ISALES_DEVICE_ID not set; gRPC heartbeat will be disabled (dev)")
+
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     orchestrator = EdgeOrchestrator(
         grpc_client=grpc_client,
@@ -265,6 +309,7 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     )
 
     stop_event = asyncio.Event()
+    heartbeat_task: asyncio.Task[None] | None = None
 
     def _request_stop() -> None:
         logger.info("edge_daemon_signal_received_stop_dev")
@@ -280,6 +325,25 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     try:
         await grpc_client.start(endpoint=endpoint, token=token)
         await orchestrator.start()
+
+        # Start gRPC heartbeat loop to sync device status to cloud.
+        if device_id is not None:
+            from isales_common.proto import cloud_edge_pb2 as pb  # noqa: PLC0415
+
+            def _status_provider() -> int:
+                if orchestrator.active_call_ids:
+                    return int(pb.DEVICE_STATUS_IN_CALL)
+                return int(pb.DEVICE_STATUS_IDLE)
+
+            heartbeat_task = asyncio.create_task(
+                grpc_heartbeat_loop(
+                    client=grpc_client,
+                    device_id=device_id,
+                    status_provider=_status_provider,
+                ),
+                name="grpc_heartbeat_dev",
+            )
+
         logger.info(
             "edge_daemon_started_dev_no_modem",
             extra={
@@ -292,6 +356,10 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
         await stop_event.wait()
     finally:
         logger.info("edge_daemon_stopping_dev")
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         # Dev teardown: emit remote_hangup{dev_terminate} for any
         # in-flight call before tearing down the RTC sessions, so the
         # cloud's state machine retires the call cleanly.
@@ -324,7 +392,7 @@ def run(argv: list[str] | None = None) -> None:
     if args.dev_no_modem and sys.platform != "darwin":
         print(
             "--dev-no-modem 仅 macOS 支持；Windows 商用走真 GSM modem + "
-            "windows-artc-pybind11 真 ARTC 路径。",
+            "DingRTC pybind 真 RTC 路径。",
             file=sys.stderr,
         )
         raise SystemExit(2)

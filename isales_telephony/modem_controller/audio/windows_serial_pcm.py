@@ -103,6 +103,7 @@ def _open_serial(
             port=serial_path,
             baudrate=baudrate,
             timeout=timeout,
+            write_timeout=0.5,  # 500ms write timeout to prevent infinite blocking
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
@@ -137,6 +138,11 @@ class _SerialPortHolder:
         self._serial: object | None = None
         self._opened = False
         self._closed = False
+        # Whether this holder owns (and may close) its pyserial handle.
+        # A holder that adopts another's handle (full-duplex share on the
+        # one audio COM port) sets this False so it never closes a handle
+        # it borrowed — the owner's close() is authoritative.
+        self._owns = True
 
     def open_port(self) -> None:
         """Open the pyserial handle. Idempotent."""
@@ -149,6 +155,33 @@ class _SerialPortHolder:
         )
         self._opened = True
 
+    def adopt_serial_from(self, other: "_SerialPortHolder") -> None:
+        """Share ``other``'s already-open pyserial handle (full-duplex).
+
+        Windows COM ports are exclusive: capture (read) and playback
+        (write) on the SAME audio port (SIMCom MI_04, e.g. COM11) CANNOT
+        each open their own handle — the second open fails with access
+        denied. So the capture opens the port and the playback adopts the
+        same handle; pyserial's Win32 backend uses independent overlapped
+        structures for read vs write, so concurrent read+write on one
+        handle is safe. The adopting side never closes the borrowed handle
+        (``_owns = False``); the owner's ``close()`` is authoritative.
+
+        Writing uplink PCM to the *Diagnostics* port (COM10) instead — to
+        dodge this double-open — was empirically proven SILENT at the far
+        end (2026-05-31); uplink MUST go to the Audio port. See
+        ``deploy/edge/windows/STATE.md`` § "SIM7600 USB audio uplink".
+        """
+        if not other._opened or other._serial is None:
+            raise SerialPcmError(
+                "adopt_serial_from: source holder is not open; call "
+                "open_port() on the capture side first"
+            )
+        self._serial = other._serial
+        self._serial_path = other._serial_path
+        self._opened = True
+        self._owns = False
+
     async def close(self) -> None:
         """Close the pyserial handle. Idempotent + safe to call from
         either backend's ``close()`` (the other side will short-circuit).
@@ -158,8 +191,8 @@ class _SerialPortHolder:
         self._closed = True
         ser = self._serial
         self._serial = None
-        if ser is None:
-            return
+        if ser is None or not self._owns:
+            return  # borrowed handle — owner closes it, we must not
         try:
             ser.close()  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 — tear-down must never raise
@@ -213,6 +246,10 @@ class WindowsSerialPcmCapture(_SerialPortHolder):
         returns whatever the pyserial ``timeout`` accumulated — which
         is fine; callers loop again and the eventual CPCMREG=1 resumes
         the stream.
+
+        Note: pyserial timeout returns b"" when no data arrives within
+        the timeout window. This is NOT an EOF — just a transient gap.
+        We retry up to ``_MAX_EMPTY_READS`` before signalling EOF.
         """
         if not self._opened:
             self.open_port()
@@ -224,7 +261,14 @@ class WindowsSerialPcmCapture(_SerialPortHolder):
         def _read_blocking() -> bytes:
             return bytes(ser.read(chunk_size))  # type: ignore[attr-defined]
 
-        return await asyncio.to_thread(_read_blocking)
+        # Retry on empty reads — CPCMREG=1 may need a few hundred ms
+        # before the modem starts streaming PCM bytes.
+        max_empty = 50  # 50 × 20 ms = 1 second grace period
+        for _ in range(max_empty):
+            data = await asyncio.to_thread(_read_blocking)
+            if data:
+                return data
+        return b""  # genuine EOF after sustained silence
 
 
 class WindowsSerialPcmPlayback(_SerialPortHolder):
@@ -264,11 +308,20 @@ class WindowsSerialPcmPlayback(_SerialPortHolder):
         assert ser is not None
 
         def _write_blocking() -> None:
-            n = ser.write(pcm)  # type: ignore[attr-defined]
-            if n is not None and n < len(pcm):
+            import serial  # noqa: PLC0415
+
+            try:
+                n = ser.write(pcm)  # type: ignore[attr-defined]
+                if n is not None and n < len(pcm):
+                    logger.warning(
+                        "serial_pcm: short write %d/%d bytes on %s",
+                        n,
+                        len(pcm),
+                        self._serial_path,
+                    )
+            except serial.SerialTimeoutException:
                 logger.warning(
-                    "serial_pcm: short write %d/%d bytes on %s",
-                    n,
+                    "serial_pcm: write_timeout %d bytes on %s",
                     len(pcm),
                     self._serial_path,
                 )

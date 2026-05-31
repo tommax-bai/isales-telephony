@@ -28,6 +28,8 @@ import contextlib
 import logging
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from isales_common.audio.rtc import (
     RtcNotJoined,
     RtcPushBackpressure,
@@ -221,14 +223,59 @@ class AudioBridge:
 
     async def _downstream_loop(self) -> None:
         """RTC inbound → filter by peer uid → resample → modem playback."""
+        _ds_count = 0
         try:
             async for frame in self._rtc.audio_frames():
-                if frame.sender_uid != self._peer_uid:
+                _ds_count += 1
+                if _ds_count <= 5 or _ds_count % 200 == 0:
+                    logger.info(
+                        "downstream_frame n=%d uid=%s peer=%s pcm=%d rate=%d",
+                        _ds_count,
+                        frame.sender_uid,
+                        self._peer_uid,
+                        len(frame.pcm),
+                        frame.sample_rate,
+                    )
+                # Accept frame if uid matches OR if uid is empty (POSITION_PLAYBACK
+                # does not provide uid — in a 2-user channel all remote frames are
+                # from the engine peer).
+                if frame.sender_uid and frame.sender_uid != self._peer_uid:
                     self.stats.downstream_uid_filtered += 1
                     continue
-                # PCM from the cloud arrives at rtc_rate (typically
-                # 16 kHz); modem expects modem_rate (typically 8 kHz).
-                resampled = self._down_resampler.resample(frame.pcm)
+                # Resample RTC frame → 8kHz mono for the SIM7600 audio port.
+                # DingRTC frames are typically 48kHz stereo, but the rate MUST
+                # come from frame.sample_rate (SSOT) — NOT a hardcoded 48kHz/6
+                # decimation — so any source rate (incl. the 16kHz test path)
+                # converts correctly and a DingRTC rate change can't silently
+                # break uplink/downlink.
+                pcm_arr = np.frombuffer(frame.pcm, dtype=np.int16)
+                # Step 1: stereo → mono (average L+R channels)
+                if frame.channels == 2:
+                    mono = ((pcm_arr[0::2].astype(np.int32) + pcm_arr[1::2].astype(np.int32)) >> 1).astype(np.int16)
+                else:
+                    mono = pcm_arr
+                # Step 2: resample frame.sample_rate → 8kHz
+                src_rate = frame.sample_rate or 8000
+                if src_rate == 8000:
+                    decimated = mono
+                elif src_rate % 8000 == 0:
+                    decimated = mono[:: src_rate // 8000]
+                else:  # non-integer ratio → linear interpolation
+                    n_out = int(len(mono) * 8000 / src_rate)
+                    decimated = np.interp(
+                        np.arange(n_out, dtype=np.float64) * src_rate / 8000.0,
+                        np.arange(len(mono), dtype=np.float64),
+                        mono.astype(np.float64),
+                    ).astype(np.int16)
+                resampled = decimated.astype(np.int16).tobytes()
+                if _ds_count <= 5:
+                    logger.info(
+                        "downstream_resampled ch=%d in=%d mono=%d out=%d",
+                        frame.channels,
+                        len(frame.pcm),
+                        len(mono) * 2,
+                        len(resampled),
+                    )
                 try:
                     await self._modem_downstream.put(resampled)
                 except RuntimeError:

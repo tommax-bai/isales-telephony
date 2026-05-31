@@ -319,8 +319,128 @@ def find_audio_serial_path(
     return None
 
 
+# SIMCom HS-USB composite exposes its primary command channel with a
+# description like "Simcom HS-USB AT PORT 9001 (COM16)". The bare "at port"
+# token discriminates it from the legacy "Modem" RAS-compat channel (which
+# also answers AT but does not carry the URC stream we rely on for dialing).
+AT_DESCRIPTION_TOKEN = "at port"
+
+
+class ModemDiscoveryError(RuntimeError):
+    """No usable AT / Audio COM port could be auto-discovered.
+
+    Raised (fail-loud) instead of falling back to an env-configured COM
+    number: COM numbers re-enumerate on every USB re-plug, so any hardcoded
+    value is guaranteed stale and a silent fallback would mask a real
+    "modem not attached / driver missing / modem wedged" condition.
+    """
+
+
+def _probe_at_ok(device: str, *, timeout: float = 0.4) -> bool:
+    """Open ``device`` and return True iff it answers ``AT`` with ``OK``.
+
+    Synchronous (one-shot startup probe, ~250 ms); vendor-neutral confirmation
+    that a description-matched candidate is really a live AT channel.
+    """
+    import time  # noqa: PLC0415
+
+    import serial  # noqa: PLC0415
+
+    try:
+        ser = serial.Serial(device, 115200, timeout=timeout)
+    except Exception:  # noqa: BLE001 — port busy / gone → not usable
+        return False
+    try:
+        ser.reset_input_buffer()
+        ser.write(b"AT\r\n")
+        time.sleep(0.25)
+        resp = ser.read(ser.in_waiting or 1).decode("ascii", "replace")
+        return "OK" in resp
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            ser.close()
+
+
+def discover_modem_serial_paths(
+    *,
+    scanner: Callable[[], Iterable["ListPortInfo"]] | None = None,
+    at_prober: Callable[[str], bool] | None = None,
+) -> tuple[str, str]:
+    """Auto-discover ``(at_path, audio_path)`` for the attached USB GSM modem.
+
+    Keys on the **stable USB descriptor** (description token + vid/pid/serial),
+    confirmed by an AT probe — NOT on the COM number, which re-enumerates on
+    every re-plug. There is deliberately **no env COM-number fallback**: a
+    hardcoded COM value is guaranteed stale, so falling back to one would be a
+    pointless middle-state that masks real failures. Raises
+    :class:`ModemDiscoveryError` (fail-loud) when discovery cannot complete.
+
+    Args:
+        scanner: Test hook — iterable of ``ListPortInfo``-shaped objects.
+            Defaults to ``serial.tools.list_ports.comports``.
+        at_prober: Test hook — ``device -> bool`` AT-OK probe. Defaults to
+            :func:`_probe_at_ok`.
+
+    Returns:
+        ``(at_path, audio_path)`` device strings, e.g. ``("COM16", "COM17")``.
+    """
+    if scanner is None:
+        try:
+            from serial.tools.list_ports import comports  # noqa: PLC0415
+
+            scanner = comports
+        except ImportError:  # pragma: no cover — pyserial in main deps
+            raise ModemDiscoveryError("pyserial not available for COM scan") from None
+    if at_prober is None:
+        at_prober = _probe_at_ok
+
+    try:
+        ports = list(scanner())
+    except Exception as exc:  # noqa: BLE001
+        raise ModemDiscoveryError(f"serial port scan failed: {exc}") from exc
+
+    at_token = AT_DESCRIPTION_TOKEN
+    at_candidates = [
+        p for p in ports
+        if at_token in (getattr(p, "description", None) or "").lower()
+    ]
+    if not at_candidates:
+        raise ModemDiscoveryError(
+            "no AT-command port found (no COM description contains "
+            f"{AT_DESCRIPTION_TOKEN!r}); is the USB GSM modem plugged in and "
+            "its driver installed?"
+        )
+
+    at_port = next((p for p in at_candidates if at_prober(p.device)), None)
+    if at_port is None:
+        raise ModemDiscoveryError(
+            f"AT-port candidate(s) {[p.device for p in at_candidates]} found but "
+            "none answered 'AT' with 'OK' — modem may be wedged (try re-plugging "
+            "the USB cable)"
+        )
+
+    vid = _vid_pid_hex(getattr(at_port, "vid", None))
+    pid = _vid_pid_hex(getattr(at_port, "pid", None))
+    usb_serial = getattr(at_port, "serial_number", None)
+    audio_path = find_audio_serial_path(
+        usb_serial=usb_serial, vid=vid, pid=pid, scanner=lambda: ports,
+    )
+    if not audio_path:
+        raise ModemDiscoveryError(
+            f"AT port {at_port.device} found but no sibling Audio port "
+            f"(same vid/pid/serial + description containing "
+            f"{AUDIO_DESCRIPTION_TOKEN!r}); check the SIMCom driver install"
+        )
+    return str(at_port.device), audio_path
+
+
 __all__ = [
+    "AT_DESCRIPTION_TOKEN",
     "AUDIO_DESCRIPTION_TOKEN",
+    "ModemDiscoveryError",
     "WindowsSerialWatcher",
+    "discover_modem_serial_paths",
     "find_audio_serial_path",
 ]

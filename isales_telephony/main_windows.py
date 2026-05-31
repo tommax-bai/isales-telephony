@@ -32,10 +32,12 @@ state bus.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from typing import TYPE_CHECKING
@@ -190,8 +192,14 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
     # existing ``at_client`` module (windows-client-core tasks.md notes
     # the fcntl-removal as a follow-up PR; until then ``main_windows.py``
     # is only fully runnable on Windows but its helpers stay testable).
+    from isales_telephony.audio_bridge import (  # noqa: PLC0415
+        get_default_rtc_session_factory,
+    )
     from isales_telephony.audio_bridge.session import (  # noqa: PLC0415
         MacosRtcSession,
+    )
+    from isales_telephony.edge.grpc_heartbeat import (  # noqa: PLC0415
+        grpc_heartbeat_loop,
     )
     from isales_telephony.edge.orchestrator import (  # noqa: PLC0415
         EdgeOrchestrator,
@@ -200,8 +208,12 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         get_capture_class,
         get_playback_class,
     )
-    from isales_telephony.modem_controller.main import (  # noqa: PLC0415
-        _make_at_client,
+    from isales_telephony.modem_controller.at_client import (  # noqa: PLC0415
+        SerialATClient,
+    )
+    from isales_telephony.modem_controller.platforms.windows_serial import (  # noqa: PLC0415
+        ModemDiscoveryError,
+        discover_modem_serial_paths,
     )
     from isales_telephony.transport.grpc_client import (  # noqa: PLC0415
         CloudEdgeGrpcClient,
@@ -212,12 +224,62 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
     endpoint = os.environ.get("ISALES_CLOUD_GRPC_ENDPOINT", DEFAULT_CLOUD_ENDPOINT)
     token = os.environ.get("ISALES_EDGE_DEVICE_TOKEN", "")
 
-    # AT + audio backends. Real Windows path picks the WindowsSerialWatcher
-    # USB-COM dispatch + WASAPI audio; if the operator overrides via env
-    # we honour that too.
-    at_client = await _make_at_client()
-    capture = get_capture_class()()
-    playback = get_playback_class()()
+    # Device ID for gRPC heartbeat — required so the cloud can identify
+    # which PG device row to sync status for.
+    device_id_raw = os.environ.get("ISALES_DEVICE_ID", "")
+    device_id: int | None = int(device_id_raw) if device_id_raw.strip() else None
+    if not device_id:
+        logger.warning(
+            "main_windows: ISALES_DEVICE_ID not set; gRPC heartbeat will be disabled"
+        )
+
+    # Auto-discover the modem's AT + Audio COM ports by USB descriptor
+    # (description token + vid/pid/serial, AT-probe confirmed). There is NO
+    # env COM-number fallback: COM numbers re-enumerate on every USB re-plug,
+    # so a hardcoded value is guaranteed stale — fail loud instead.
+    try:
+        at_path, audio_serial_path = discover_modem_serial_paths()
+    except ModemDiscoveryError as exc:
+        raise RuntimeError(f"modem auto-discovery failed: {exc}") from exc
+    logger.info("modem auto-discovered at=%s audio=%s", at_path, audio_serial_path)
+    at_client = await SerialATClient.create_from_tty(
+        at_path, driver_hint=os.environ.get("ISALES_MODEM_DRIVER", ""),
+    )
+    # Reset CPCMREG state in case previous session crashed without cleanup.
+    with contextlib.suppress(Exception):
+        await at_client.cpcmreg_disable()
+    # Set PCM audio frame format to 8K (CPCMFRM=0). The whole data path
+    # (audio_io 320B/20ms frames, SerialPcm) is 8kHz; forcing 16K (=1)
+    # would starve the modem at half the expected rate. On the test rig's
+    # firmware (LE20B04SIM7600G22) the SET returns ERROR and is suppressed,
+    # leaving the modem at its 8K default — which is the proven-working
+    # config (2026-05-31 far-end heard 8K-written tone). See STATE.md.
+    with contextlib.suppress(Exception):
+        await at_client._at.send("AT+CPCMFRM=0", timeout=2.0)
+    logger.info("READY:modem_registered")
+
+    # audio_serial_path was auto-discovered above (same physical USB device
+    # as the AT channel). Uplink PCM MUST be written to the Audio port (SIMCom MI_04, e.g.
+    # COM11), which is FULL-DUPLEX (read = downlink, write = uplink) — NOT
+    # the Diagnostics port (COM10). Writing to COM10 to dodge the Windows
+    # exclusive-open conflict was empirically proven SILENT at the far end
+    # (2026-05-31); see deploy/edge/windows/STATE.md § "SIM7600 USB audio
+    # uplink". Because Windows COM ports are exclusive, capture opens the
+    # one handle and playback adopts it (pyserial uses independent
+    # overlapped read/write, so concurrent read+write on one handle is safe).
+    capture = get_capture_class()(audio_serial_path)
+    playback = get_playback_class()(audio_serial_path)
+
+    capture.open_port()
+    playback.adopt_serial_from(capture)
+    logger.info("audio_port_opened (shared handle) audio=%s", audio_serial_path)
+
+    # Verify DingRTC pybind SDK is importable (fail-fast before gRPC).
+    try:
+        import dingrtc_pywrap  # noqa: F401, PLC0415
+        logger.info("READY:dingrtc_loaded")
+    except ImportError:
+        logger.warning("dingrtc_pywrap not importable — RTC calls will fail")
 
     event_buffer = _build_event_buffer()
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
@@ -228,7 +290,7 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         at_client=at_client,
         capture=capture,
         playback=playback,
-        rtc_session_factory=MacosRtcSession,  # stub; D2 production swaps in WindowsDingRtcSession via audio_bridge.get_default_rtc_session_factory(app_id=...) — see edge/main.py
+        rtc_session_factory=get_default_rtc_session_factory(app_id=os.environ.get("ISALES_RTC_APP_ID", "")),
     )
 
     activation_controller = ActivationController(
@@ -260,6 +322,7 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         try:
             await grpc_client.start(endpoint=endpoint, token=token)
             state_bus.update(cloud_link=CloudLinkState.CONNECTED)
+            logger.info("READY:grpc_connected")
         except Exception:  # noqa: BLE001
             logger.exception("main_windows: initial gRPC connect failed")
             state_bus.update(cloud_link=CloudLinkState.DISCONNECTED)
@@ -272,6 +335,26 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
                 name="grpc_watcher",
             )
 
+            # gRPC heartbeat: report device status to cloud every 30s.
+            # The first heartbeat fires immediately on connect so the
+            # cloud resets any stale status (e.g. dialing → idle).
+            if device_id is not None:
+                from isales_common.proto import cloud_edge_pb2 as pb  # noqa: PLC0415
+
+                def _device_status_provider() -> int:
+                    if orchestrator.active_call_ids:
+                        return int(pb.DEVICE_STATUS_IN_CALL)
+                    return int(pb.DEVICE_STATUS_IDLE)
+
+                tg.create_task(
+                    grpc_heartbeat_loop(
+                        client=grpc_client,
+                        device_id=device_id,
+                        status_provider=_device_status_provider,
+                    ),
+                    name="grpc_heartbeat",
+                )
+
             # Wait for the stop signal in a tracked task so the group
             # exits cleanly when the user hits "退出".
             async def _wait_stop() -> None:
@@ -283,21 +366,32 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         pass
     finally:
         logger.info("main_windows: shutting down")
+        await _graceful_cleanup(orchestrator, grpc_client, at_client, event_buffer)
+
+
+async def _graceful_cleanup(
+    orchestrator: "EdgeOrchestrator",
+    grpc_client: "CloudEdgeGrpcClient",
+    at_client: object,
+    event_buffer: "SqliteEventBuffer | None",
+) -> None:
+    """Run shutdown with a per-step timeout to prevent hanging."""
+    step_timeout = 3.0  # seconds per cleanup step
+
+    async def _safe(coro, name: str) -> None:  # noqa: ANN001
         try:
-            await orchestrator.stop()
+            await asyncio.wait_for(coro, timeout=step_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("main_windows: %s timed out after %.1fs", name, step_timeout)
         except Exception:  # noqa: BLE001
-            logger.exception("main_windows: orchestrator.stop failed")
-        try:
-            await grpc_client.stop()
-        except Exception:  # noqa: BLE001
-            logger.exception("main_windows: grpc_client.stop failed")
-        if event_buffer is not None:
-            event_buffer.close()
-        if hasattr(at_client, "aclose"):
-            try:
-                await at_client.aclose()
-            except Exception:  # noqa: BLE001
-                logger.exception("main_windows: at_client.aclose failed")
+            logger.exception("main_windows: %s failed", name)
+
+    await _safe(orchestrator.stop(), "orchestrator.stop")
+    await _safe(grpc_client.stop(), "grpc_client.stop")
+    if event_buffer is not None:
+        event_buffer.close()
+    if hasattr(at_client, "aclose"):
+        await _safe(at_client.aclose(), "at_client.aclose")
 
 
 # Module-level dict so tray menu callbacks (sync, run on pystray thread)
@@ -333,12 +427,51 @@ def _menu_quit() -> None:
         stop.set()
 
 
-def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
+# Shutdown grace period — after this timeout, force-kill the process.
+_SHUTDOWN_TIMEOUT_S = 5.0
+
+
+def _install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    stop_event: asyncio.Event,
+    app: "QtWidgets.QApplication",
+) -> None:
     """Best-effort SIGINT / SIGTERM. On Windows ``add_signal_handler``
-    raises ``NotImplementedError``; fall back to ``signal.signal``."""
+    raises ``NotImplementedError``; fall back to ``signal.signal``.
+
+    A guard flag ensures that the shutdown sequence fires at most once.
+    A second signal restores default behaviour (hard-kill on third).
+
+    Force-exit uses ``threading.Timer`` (independent OS thread) instead of
+    ``loop.call_later`` — the latter is unreliable under qasync because if
+    the Qt event loop is blocked (e.g. by gRPC reconnection) the callback
+    never fires.
+    """
+    _shutting_down = False
+
+    def _force_exit() -> None:
+        logger.error("main_windows: graceful shutdown timed out, forcing exit")
+        # os._exit bypasses Python cleanup; sys.exit could be caught.
+        os._exit(1)
+
     def _request_stop() -> None:
+        nonlocal _shutting_down
+        if _shutting_down:
+            # Already shutting down — second signal → restore default so a
+            # third Ctrl+C hard-kills immediately via OS.
+            logger.warning("main_windows: repeated signal during shutdown, next will force-kill")
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            return
+        _shutting_down = True
         logger.info("main_windows: signal received, stopping")
         stop_event.set()
+        # Use threading.Timer (runs in a separate OS thread) so the
+        # force-exit is guaranteed to fire even if the event loop is
+        # blocked or not pumping callbacks.
+        _kill_timer = threading.Timer(_SHUTDOWN_TIMEOUT_S, _force_exit)
+        _kill_timer.daemon = True
+        _kill_timer.start()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -380,7 +513,7 @@ def run() -> None:
     logging.getLogger().addHandler(log_handler)
 
     stop_event = asyncio.Event()
-    _install_signal_handlers(loop, stop_event)
+    _install_signal_handlers(loop, stop_event, app)
 
     menu_bridge = AsyncMenuBridge(
         loop=loop,
@@ -399,6 +532,8 @@ def run() -> None:
             )
     finally:
         tray.stop()
+        # Ensure the Qt application exits its event loop.
+        app.quit()
         # Drop the log handler so a follow-up run() in tests doesn't
         # accumulate duplicates.
         logging.getLogger().removeHandler(log_handler)

@@ -83,7 +83,11 @@ async def test_read_chunk_returns_partial_during_cpcmreg_disabled() -> None:
 
     out = await cap.read_chunk()
     assert out == b""
-    assert fake.read_calls == [DEFAULT_CHUNK_BYTES]
+    # read_chunk retries empty reads up to a ~1s grace period (50 × 20 ms)
+    # before signalling EOF — the modem may take a few hundred ms to start
+    # streaming after CPCMREG=1, so a single empty read is not EOF.
+    assert len(fake.read_calls) == 50
+    assert all(n == DEFAULT_CHUNK_BYTES for n in fake.read_calls)
 
 
 # ---------- (b) read_chunk returns full 320 bytes after PCM starts ----------

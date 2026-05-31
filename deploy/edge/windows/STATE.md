@@ -1,5 +1,11 @@
 # Windows edge dev rig — current state snapshot
 
+> **2026-05-31 — SIM7600 USB 音频上行实测【可用】**(对端真人听到 tone)。
+> 之前一度的"Windows 写不进"是 **modem 音频 OUT 卡死态**,跨通话/跨
+> CPCMREG 清不掉,仅整机重启复位 —— **非 Windows / 非驱动版本限制**。详见
+> 下方 § "SIM7600 USB audio uplink — 实测可用"。重插后 COM 号重排为
+> AT=COM16 / AUDIO=COM17(认 description,不认数字)。
+
 **Last updated**: 2026-05-30 — DingRTC Windows SDK 3.9.0 vendored at
 `~/codes/vendor/DingRTC_Windows_SDK_3_9_0/` (sha256 `F594...19974`
 matches mac/ECS); `dingrtc_pywrap` binding built + import + JOIN smoke
@@ -299,6 +305,77 @@ SerialATClient init OK, AT+CPCMREG=? returns `(0-1)`, AT+CPCMREG=1
 outside call returns ERROR → PcmEnableError, etc.). Last run
 2026-05-17 23:00 CST all green (commit `aeff11e`).
 
+## SIM7600 USB audio uplink — 实测可用 (2026-05-31)
+
+**结论:USB 音频上行(主机→modem→对端 GSM)在 Windows 下工作。** 干净
+重启后,通话中 `AT+CPCMREG=1`,往音频口写 8kHz/16bit/mono、320B/20ms
+paced PCM,**对端真人听到 1kHz tone**(`retest_audio_write.py` 三变体
+rtscts / dsrdtr+DTR-RTS / 单线程 lockstep 全 ok≈149、零 timeout;线状态
+通话中 cts/dsr/cd 全 True)。流控不是关键变量。
+
+**失败模式(曾误判为"写不进"):** modem 音频 **OUT 端点会进卡死态** ——
+写全 `SerialTimeoutException`(ok=0),或阻塞写 `write_timeout=None` 第一帧
+永久挂死;且**跨通话、跨 `AT+CPCMREG=0/1` 都清不掉**,只有整机重启
+(物理重插已验证;`AT+CRESET` 软重启**待验证**)复位。疑似诱因(均非正常
+操作):① `AT+CPCMFRM=1`(16K)与 8K 数据错配;② 阻塞写挂死留未决
+overlapped WriteFile;③ **`AT+CFTRANRX` 灌大文件直接把整机 modem 搞挂**
+(所有 AT 口失联,软恢复全失效,只能物理重插)。
+
+**诊断旁证:** downlink 读音频口 ≈32KB/s 偏 16kHz,但 8K uplink 写对端能听到;
+模块自带 `C:` ~8.4MB/~1.8MB 可用(`AT+FSMEM`)。
+
+**生产待办(→ OpenSpec change):**
+- `isales_telephony/modem_controller/audio/windows_serial_pcm.py` 当前
+  `write_chunk` **静默吞掉 `SerialTimeoutException`** —— 应改为:持续写超时
+  = "OUT 卡死"信号 → 触发 modem 软复位(`AT+CRESET`/`AT+CFUN`)而非假装无事
+  (踩中 root CLAUDE.md "多层 fallback / 静默兜底是坏味道")。
+- 边缘 daemon 会话初应从**干净 modem 状态**起步;验证软复位能否替代物理重插。
+- 严格 8K paced 写;禁用阻塞 `write_timeout=None`;音频口禁写错格式;禁
+  `AT+CFTRANRX` 大文件。
+- **备选(文件式,非实时)** `AT+CCMXPLAYWAV="C:/x.wav",1` 送对端,本固件支持
+  (`=? → (1-2),(0-255)`),仅适合静态开场白/IVR;上传 `CFTRANRX` 有搞挂风险。
+
+**✅ 上行写口已修复并真拨验证(2026-05-31):**`main_windows.py` +
+`edge/main.py` 的 playback 已改为写 **Audio 口** + `adopt_serial_from(capture)`
+共享句柄;用生产类 `validate_shared_handle_dial.py` 真拨 13301035545 实测
+`cap._serial is pb._serial=True`、并发读写、**对端听到 tone**。另:COM 口已
+改 **USB 描述符自动发现**(`discover_modem_serial_paths()`,无 env COM 号兜底,
+发现失败 fail-loud),真机实测返回 AT=COM16/AUDIO=COM17;bridge 重采样改
+rate-aware(用 `frame.sample_rate`,非写死 48kHz)。详见 OpenSpec change
+`edge-modem-audio-out-recovery` §7/§8/§9。以下为修复前的根因记录:
+
+**⚠️ 上行写口纠正(2026-05-31,影响真拨号):上行 PCM MUST 写 Audio 口
+(COM11/MI_04),NOT Diagnostics 口(COM10)。** `tone_listen_test` 实测:写
+COM10 / COM9 对端**两段全无声**(串口吞字节但不进通话);写 COM11/Audio
+对端**听到 tone**。Audio 口是**全双工**——读(downlink)与写(uplink)走同
+一口。`main_windows.py` 现把 `playback` 路由到 `ISALES_MODEM_PCM_WRITE_SERIAL_PATH`
+默认 `COM10`(基于"COM11 只读"的错误理论,该理论源自卡死态下 COM11 写被堵
+→ 误判),**带此配置真拨号 AI 语音进不了电话**。`edge/main.py::_build_audio_backends`
+的 windows 分支是对的(capture+playback 同一 `audio_path`)。
+
+**双开冲突 → 必须共享句柄:** Windows COM 口独占,capture 已占 COM11,
+playback 不能再开 COM11(故当初绕道 COM10)。正解:capture 与 playback
+**共享同一个 pyserial 句柄**(单 handle 并发读+写,overlapped IO 支持;
+diag Phase D 实测单句柄并发读写可行)。`windows_serial_pcm.py` 的
+`_SerialPortHolder` 设计意图即共享,但当前构造为两个独立实例未真正共享 →
+需补共享句柄 wiring(随 `edge-modem-audio-out-recovery` OpenSpec change 一并修)。
+
+**集成侧已发现的硬件约束(WIP 代码,待并入正式文档):**
+- `audio_io.py::run_playback_pump`:**写不足整帧(<320B)会让 SIM7600 USB
+  CDC 端点无限阻塞** → 必须累积到 320B(20ms@8kHz)整帧再写(已实现)。
+- `bridge.py::_downstream_loop`:DingRTC `POSITION_PLAYBACK` 入站帧 **uid 为
+  空** → 2 人房间里 uid 空时也应收(已实现)。
+- `at_client.py::cpcmreg_enable`:CPCMREG=1 失败 → CPCMREG=0 → 重试(已实现)。
+- `orchestrator.py`:teardown self-await 死锁修复(跳过 current task,已实现)。
+- 这些 WIP **截至 2026-05-31 仍未提交**(working tree dirty;reflog 末条是
+  `reset: moving to HEAD`,疑似 staged 后被 reset)。
+
+诊断脚本(留在 isales-telephony 仓根):`retest_audio_write.py`
+(证明上行可用 + 线状态,三变体写)、`diag_com11_audio.py`(读/写×端口
+四方向探针)。其余一次性脚本(echo / probe / tone-listen / CCMXPLAYWAV
+play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传坑
+见上文,如需重建按描述即可。
+
 ## Cloud-edge gRPC smoke (Windows → ECS, verified 2026-05-17 23:25 CST)
 
 The Windows dev box can reach ECS `121.89.85.150:50051` over plain
@@ -325,7 +402,7 @@ Token (`device_id=edge-01`, 365d TTL, minted on ECS 2026-05-17) sits at
 | **pybind §9.4 real ARTC RTC join smoke** | Needs RTC client join token (signed with `ISALES_RTC_APP_KEY` from ECS engine.env) — either scp the AppKey down, or sign the token on ECS and scp it down | Easy: scp + write a small `scripts/pybind_rtc_join_smoke.py` |
 | **pybind §9.5 real PCM push/pull P95** | Needs §9.4 first + engine side joining same channel + clock-aligned latency measure | Medium: requires ECS engine to be put into a "listen on test channel" mode, or write a separate Linux-side listener using the ARTC Linux Python wrapper |
 | **PyInstaller frozen-exe smoke (§9.3)** | Needs `build.ps1` full run end-to-end (will succeed now that toolchain is in place) + a clean Win PC for the final unwrap-and-launch test | User: need clean PC, OR I can produce the zip and we test on dev box for partial coverage |
-| **D1 §9.3 真拨号 13301035545** | All of the above + AI provider stack ready (engine side) + PG seed data (campaign + lead) + edge daemon dialing through cloud-edge gRPC | Joint MVP gate; multiple pieces |
+| **D1 §9.3 真拨号 13301035545** | All of the above + AI provider stack ready (engine side) + PG seed data (campaign + lead) + edge daemon dialing through cloud-edge gRPC | Joint MVP gate; multiple pieces. **音频上行已 unblock**(2026-05-31 对端听到 tone,见 § "SIM7600 USB audio uplink — 实测可用");剩 OUT-卡死软复位 + `windows_serial_pcm.py` 硬化 |
 
 ## Bootstrap a new dev session — verify before asserting state
 

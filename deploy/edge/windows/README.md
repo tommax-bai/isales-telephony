@@ -14,7 +14,7 @@
 |---|---|
 | OS | Windows 10 21H2+ (x64) 或 Windows 11 (x64) |
 | RAM | ≥ 4 GB |
-| 磁盘 | ≥ 200 MB 可用空间（程序 + ARTC SDK + 日志） |
+| 磁盘 | ≥ 200 MB 可用空间（程序 + DingRTC SDK + 日志） |
 | 网络 | 出站可访 `isales.<your-region>.aliyuncs.com:443` + 阿里 RTC UDP 段 |
 | 权限 | 普通用户即可（无需管理员） |
 | 硬件 | 1 个 USB 口接 GSM modem（华为 / 中兴 / SIMCom / Quectel 主流） |

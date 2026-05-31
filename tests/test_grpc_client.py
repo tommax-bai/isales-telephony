@@ -741,7 +741,10 @@ async def test_reconnect_after_unavailable_during_stream_read(
     ]
     error_logs = [
         r for r in caplog.records
-        if r.getMessage() == "cloud_edge_stream_error"
+        # message carries inline code/details now ("cloud_edge_stream_error:
+        # code=UNAVAILABLE details=..."), so match on the stable event-key
+        # prefix rather than exact equality.
+        if r.getMessage().startswith("cloud_edge_stream_error")
     ]
     assert len(connected_logs) >= 2, (
         "expected ≥ 2 cloud_edge_stream_connected (initial + post-reconnect); "

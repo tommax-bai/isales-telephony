@@ -154,12 +154,17 @@ class _CallContext:
 
         Idempotent: safe to call multiple times.
         """
+        # Skip the currently-running task to avoid self-await deadlock
+        # when teardown is called from within _pump_at_events (which is
+        # itself stored in self.tasks for stop()-initiated cleanup).
+        current = asyncio.current_task()
         for task in self.tasks:
-            if not task.done():
+            if task is not current and not task.done():
                 task.cancel()
         for task in self.tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+            if task is not current:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
         self.tasks.clear()
         if self.bridge is not None:
             with contextlib.suppress(Exception):

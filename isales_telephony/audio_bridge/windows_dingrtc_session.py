@@ -222,8 +222,15 @@ class WindowsDingRtcSession(RtcSession):
             engine.set_event_listener(listener)
             engine.register_audio_observer(observer)
             engine.enable_audio_frame_observer(
-                enabled=True, position=_dingrtc.POSITION_PLAYBACK,
+                enabled=True, position=_dingrtc.POSITION_REMOTE_USER,
             )
+            # Disable SDK's internal audio device access — edge has no
+            # sound card, audio goes through modem serial PCM (COM11).
+            # Must be called before join per SDK docs.
+            engine.enable_custom_audio_capture(enable=True)
+            # NOTE: EnableCustomAudioRender(true) kills the entire receive
+            # pipeline including POSITION_REMOTE_USER. Do NOT enable it.
+            # We accept local speaker output for now as a diagnostic step.
             engine.set_external_audio_source(
                 enable=True,
                 sample_rate=self._send_sample_rate,
@@ -337,6 +344,7 @@ class WindowsDingRtcSession(RtcSession):
         assert self._frame_queue is not None
         buf = self._buffer
         q = self._frame_queue
+        _drain_count = 0
         try:
             while True:
                 frames = buf.drain(_DRAIN_BATCH_SIZE)
@@ -344,6 +352,12 @@ class WindowsDingRtcSession(RtcSession):
                     await asyncio.sleep(_DRAIN_TICK_SECONDS)
                     continue
                 for raw in frames:
+                    _drain_count += 1
+                    if _drain_count <= 3 or _drain_count % 100 == 0:
+                        logger.info(
+                            "drainer_frame_received",
+                            extra={"count": _drain_count, "uid": getattr(raw, "remote_uid", "?"), "pcm_len": len(getattr(raw, "pcm", b""))},
+                        )
                     pcm_frame = PcmFrame(
                         sender_uid=getattr(raw, "remote_uid", "") or "",
                         pcm=bytes(getattr(raw, "pcm", b"")),

@@ -373,9 +373,18 @@ class SerialATClient:
         from isales_telephony.modem_controller.serial_protocol import AtError
 
         try:
-            await self._at.send("AT+CPCMREG=1", timeout=2.0)
-        except AtError as exc:
-            raise PcmEnableError(detail=str(exc)) from exc
+            await self._at.send("AT+CPCMREG=1", timeout=5.0)
+        except AtError:
+            # Retry: reset PCM state and try once more with longer timeout
+            logger.warning("cpcmreg_enable first attempt failed, retrying after reset")
+            try:
+                await self._at.send("AT+CPCMREG=0", timeout=2.0)
+            except AtError:
+                pass
+            try:
+                await self._at.send("AT+CPCMREG=1", timeout=8.0)
+            except AtError as exc2:
+                raise PcmEnableError(detail=str(exc2)) from exc2
 
     async def cpcmreg_disable(self) -> None:
         """``AT+CPCMREG=0`` — close the audio COM PCM byte stream.

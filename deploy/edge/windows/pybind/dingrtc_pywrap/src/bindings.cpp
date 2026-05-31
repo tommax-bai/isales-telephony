@@ -30,6 +30,7 @@
 
 #include "engine_interface.h"  // ding::rtc::RtcEngine
 #include "engine_types.h"      // ding::rtc::RtcEngineAuthInfo etc.
+#include "engine_device_manager.h" // ding::rtc::RtcEngineAudioDeviceManager
 
 #include <atomic>
 #include <memory>
@@ -151,6 +152,45 @@ public:
         }
     }
 
+    void set_external_audio_render(bool enable, int sample_rate, int channels) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->SetExternalAudioRender(enable, sample_rate, channels);
+        }
+        if (rc < 0) {
+            throw DingRtcError(rc, "SetExternalAudioRender failed");
+        }
+    }
+
+    void enable_custom_audio_capture(bool enable) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->EnableCustomAudioCapture(enable);
+        }
+        if (rc < 0) {
+            throw DingRtcError(rc, "EnableCustomAudioCapture failed");
+        }
+    }
+
+    void enable_custom_audio_render(bool enable) {
+        int rc;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            require_alive_locked();
+            py::gil_scoped_release nogil;
+            rc = engine_->EnableCustomAudioRender(enable);
+        }
+        if (rc < 0) {
+            throw DingRtcError(rc, "EnableCustomAudioRender failed");
+        }
+    }
+
     void push_external_audio(py::bytes pcm, int sample_rate, int channels,
                               int bytes_per_sample, long long timestamp) {
         std::string buf = pcm;
@@ -225,6 +265,66 @@ public:
         if (rc != 0) {
             throw DingRtcError(rc, "SubscribeAllRemoteAudioStreams failed");
         }
+    }
+
+    // --- Audio device management ---
+
+    py::list get_recording_device_list() {
+        std::lock_guard<std::mutex> lk(mu_);
+        require_alive_locked();
+        auto* mgr = engine_->GetAudioDeviceManager();
+        if (!mgr) throw DingRtcError(-1, "GetAudioDeviceManager returned nullptr");
+        auto* list = mgr->GetRecordingDeviceList();
+        py::list result;
+        if (list) {
+            for (unsigned int i = 0; i < list->GetCount(); ++i) {
+                auto info = list->GetDeviceInfo(i);
+                py::dict d;
+                d["name"] = std::string(info.deviceName.c_str());
+                d["id"] = std::string(info.deviceID.c_str());
+                result.append(d);
+            }
+            list->Release();
+        }
+        return result;
+    }
+
+    py::list get_playout_device_list() {
+        std::lock_guard<std::mutex> lk(mu_);
+        require_alive_locked();
+        auto* mgr = engine_->GetAudioDeviceManager();
+        if (!mgr) throw DingRtcError(-1, "GetAudioDeviceManager returned nullptr");
+        auto* list = mgr->GetPlayoutDeviceList();
+        py::list result;
+        if (list) {
+            for (unsigned int i = 0; i < list->GetCount(); ++i) {
+                auto info = list->GetDeviceInfo(i);
+                py::dict d;
+                d["name"] = std::string(info.deviceName.c_str());
+                d["id"] = std::string(info.deviceID.c_str());
+                result.append(d);
+            }
+            list->Release();
+        }
+        return result;
+    }
+
+    void set_recording_device(const std::string &device_id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        require_alive_locked();
+        auto* mgr = engine_->GetAudioDeviceManager();
+        if (!mgr) throw DingRtcError(-1, "GetAudioDeviceManager returned nullptr");
+        int rc = mgr->SetCurrentRecordingDeviceId(device_id.c_str());
+        if (rc != 0) throw DingRtcError(rc, "SetCurrentRecordingDeviceId failed");
+    }
+
+    void set_playout_device(const std::string &device_id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        require_alive_locked();
+        auto* mgr = engine_->GetAudioDeviceManager();
+        if (!mgr) throw DingRtcError(-1, "GetAudioDeviceManager returned nullptr");
+        int rc = mgr->SetCurrentPlayoutDeviceId(device_id.c_str());
+        if (rc != 0) throw DingRtcError(rc, "SetCurrentPlayoutDeviceId failed");
     }
 
     /// JoinChannel via RtcEngineAuthInfo struct.
@@ -384,6 +484,12 @@ PYBIND11_MODULE(dingrtc_pywrap, m) {
              py::arg("enabled"), py::arg("position"))
         .def("set_external_audio_source",         &EngineHandle::set_external_audio_source,
              py::arg("enable"), py::arg("sample_rate") = 16000, py::arg("channels") = 1)
+        .def("set_external_audio_render",         &EngineHandle::set_external_audio_render,
+             py::arg("enable"), py::arg("sample_rate") = 16000, py::arg("channels") = 1)
+        .def("enable_custom_audio_capture",       &EngineHandle::enable_custom_audio_capture,
+             py::arg("enable"))
+        .def("enable_custom_audio_render",        &EngineHandle::enable_custom_audio_render,
+             py::arg("enable"))
         .def("push_external_audio",               &EngineHandle::push_external_audio,
              py::arg("pcm"), py::arg("sample_rate") = 16000, py::arg("channels") = 1,
              py::arg("bytes_per_sample") = 2, py::arg("timestamp") = 0)
@@ -393,6 +499,12 @@ PYBIND11_MODULE(dingrtc_pywrap, m) {
              py::arg("enabled"))
         .def("subscribe_all_remote_audio_streams", &EngineHandle::subscribe_all_remote_audio_streams,
              py::arg("sub"))
+        .def("get_recording_device_list",         &EngineHandle::get_recording_device_list)
+        .def("get_playout_device_list",           &EngineHandle::get_playout_device_list)
+        .def("set_recording_device",              &EngineHandle::set_recording_device,
+             py::arg("device_id"))
+        .def("set_playout_device",                &EngineHandle::set_playout_device,
+             py::arg("device_id"))
         .def("join_channel",                      &EngineHandle::join_channel,
              py::arg("channel_id"), py::arg("user_id"), py::arg("app_id"),
              py::arg("token"),

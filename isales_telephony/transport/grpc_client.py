@@ -263,11 +263,15 @@ class CloudEdgeGrpcClient(CloudEdgeClient):
             except asyncio.CancelledError:
                 return
             except grpc.aio.AioRpcError as exc:
+                code_name = exc.code().name if exc.code() else "UNKNOWN"
+                details = exc.details() or ""
                 logger.warning(
-                    "cloud_edge_stream_error",
+                    "cloud_edge_stream_error: code=%s details=%r",
+                    code_name,
+                    details,
                     extra={
-                        "code": exc.code().name if exc.code() else None,
-                        "details": exc.details(),
+                        "code": code_name,
+                        "details": details,
                     },
                 )
             except Exception:  # noqa: BLE001 — defensive: never let connect loop die

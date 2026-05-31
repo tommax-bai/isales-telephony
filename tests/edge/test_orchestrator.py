@@ -401,7 +401,10 @@ async def test_handle_connected_calls_cpcmreg_enable_before_join() -> None:
     await grpc.push_from_cloud(_dial_command())
 
     for _ in range(50):
-        if "call_event:remote_hangup" in _kinds(grpc.sent):
+        if (
+            "call_event:remote_hangup" in _kinds(grpc.sent)
+            and "disable" in at.cpcmreg_calls
+        ):
             break
         await asyncio.sleep(0.01)
 

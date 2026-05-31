@@ -9,7 +9,7 @@ Spec: joint-mvp-gate-13301035545 § 7。
   1. pre-flight: 调 §1 spot-check (modem AT / pybind import / cloud-edge
      gRPC smoke / SIM 余额 / ECS health)
   2. 启 edge daemon (``isales_telephony.main_windows``) 后台
-  3. 等 daemon log ``modem_registered`` + ``grpc_connected`` + ``artc_loaded``
+  3. 等 daemon log ``READY:modem_registered`` + ``READY:grpc_connected`` + ``READY:dingrtc_loaded``
   4. SSH ECS: ``curl POST /api/campaigns/{id}/start`` 用 admin JWT
   5. SSH ECS: 轮询 ``call_record`` by lead_id → 等 status 走 connecting →
      connected → ended (timeout 60s)
@@ -40,19 +40,34 @@ import time
 from pathlib import Path
 
 DEFAULT_SSH_HOST = "root@121.89.85.150"
-DEFAULT_SSH_KEY = "C:/Users/tianx/codes/isales.pem"
+DEFAULT_SSH_KEY = "C:/Users/tianx/codes/isales-4.pem"
+REDIS_CLI = "redis-cli -a ***REMOVED***"
 EDGE_DAEMON_LOG = Path(os.environ.get("APPDATA", "")) / "isales" / "logs" / "telephony.log"
 
 
-def run_ssh(*, ssh_host: str, ssh_key: str, remote_cmd: str, timeout: int = 30) -> str:
-    """run cmd over ssh，返回 stdout；非 0 sys.exit。"""
+def run_ssh(
+    *, ssh_host: str, ssh_key: str, remote_cmd: str, timeout: int = 30,
+    retries: int = 0, retry_delay: float = 3.0,
+) -> str:
+    """run cmd over ssh，返回 stdout；非 0 sys.exit（retries>0 时先重试）。"""
     cmd = [
-        "ssh", "-i", ssh_key, "-o", "ConnectTimeout=10", ssh_host, remote_cmd,
+        "ssh", "-i", ssh_key, "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
+        ssh_host, remote_cmd,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        sys.exit(f"ssh failed (rc={proc.returncode}): {proc.stderr}")
-    return proc.stdout
+    last_err = ""
+    for attempt in range(1 + retries):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+            if proc.returncode == 0:
+                return proc.stdout
+            last_err = f"ssh failed (rc={proc.returncode}): {proc.stderr}"
+        except subprocess.TimeoutExpired:
+            last_err = f"ssh timeout ({timeout}s)"
+        if attempt < retries:
+            print(f"  ⚠ ssh attempt {attempt+1} failed, retrying in {retry_delay}s ...", file=sys.stderr)
+            time.sleep(retry_delay)
+    sys.exit(last_err)
 
 
 def step_preflight(args) -> None:
@@ -84,9 +99,88 @@ def step_preflight(args) -> None:
         ssh_key=args.ssh_key,
         remote_cmd="systemctl is-active isales-api isales-engine isales-scheduler isales-worker",
     )
-    if out.strip().count("active") != 4:
-        sys.exit(f"  ✗ ECS 4 services 不全 active: {out!r}")
+    statuses = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    if len(statuses) != 4 or any(s != "active" for s in statuses):
+        sys.exit(f"  ✗ ECS 4 services 不全 active: {statuses!r}")
     print("  ✓ ECS 4 services active", file=sys.stderr)
+
+
+def step_verify_prerequisites(args) -> None:
+    """[1.5/6] verify lead/campaign/device association chain."""
+    print("[1.5/6] verifying data prerequisites ...", file=sys.stderr)
+
+    # 1) Lead 存在且状态可派发
+    sql = f"SELECT id, status, next_call_at FROM lead WHERE id = {args.lead_id}"
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f'sudo -u postgres psql -d isales -tA -F "|" -c "{sql}"',
+    )
+    line = out.strip()
+    if not line:
+        sys.exit(f"  ✗ lead_id={args.lead_id} not found in PG")
+    parts = line.split("|")
+    lead_status = parts[1] if len(parts) > 1 else "unknown"
+    if lead_status not in ("new", "retrying", "following_up"):
+        sys.exit(f"  ✗ lead.status='{lead_status}', expected new/retrying/following_up")
+    print(f"  lead_id={args.lead_id} status={lead_status} ✓", file=sys.stderr)
+
+    # 2) Campaign 存在
+    sql = f"SELECT id FROM campaign WHERE id = {args.campaign_id}"
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f'sudo -u postgres psql -d isales -tA -c "{sql}"',
+    )
+    if not out.strip():
+        sys.exit(f"  ✗ campaign_id={args.campaign_id} not found in PG")
+    print(f"  campaign_id={args.campaign_id} exists ✓", file=sys.stderr)
+
+    # 3) Device idle + campaign_device + SIM binding
+    sql = (
+        "SELECT d.id, d.status, sc.phone_number "
+        "FROM device d "
+        "JOIN campaign_device cd ON cd.device_id = d.id "
+        "JOIN device_sim_binding dsb ON dsb.device_id = d.id AND dsb.is_active = true "
+        "JOIN sim_card sc ON sc.id = dsb.sim_card_id "
+        f"WHERE cd.campaign_id = {args.campaign_id} AND d.status = 'idle' "
+        "LIMIT 1"
+    )
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f'sudo -u postgres psql -d isales -tA -F "|" -c "{sql}"',
+    )
+    if not out.strip():
+        # 诊断：什么原因导致没有可用 device
+        diag_sql = (
+            "SELECT d.id, d.status FROM device d "
+            "JOIN campaign_device cd ON cd.device_id = d.id "
+            f"WHERE cd.campaign_id = {args.campaign_id}"
+        )
+        diag_out = run_ssh(
+            ssh_host=args.ssh_host,
+            ssh_key=args.ssh_key,
+            remote_cmd=f'sudo -u postgres psql -d isales -tA -F "|" -c "{diag_sql}"',
+        )
+        sys.exit(
+            f"  ✗ No idle device with SIM for campaign={args.campaign_id}.\n"
+            f"    Campaign devices: {diag_out.strip() or '(none)'}"
+        )
+    device_info = out.strip().split("|")
+    print(f"  device_id={device_info[0]} status={device_info[1]} phone={device_info[2]} ✓", file=sys.stderr)
+
+    # 4) Redis 并发计数器检查
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f"{REDIS_CLI} GET isales:concurrency:active",
+    )
+    val = out.strip()
+    if val and val != "(nil)" and int(val) > 0:
+        print(f"  ⚠ Redis concurrency counter={val} (non-zero, may block dispatch)", file=sys.stderr)
+    else:
+        print(f"  concurrency counter=0 ✓", file=sys.stderr)
 
 
 def step_start_daemon(args) -> subprocess.Popen[str]:
@@ -110,8 +204,8 @@ def step_start_daemon(args) -> subprocess.Popen[str]:
 
 
 def step_wait_daemon_ready(*, log_path: Path, timeout: int = 30) -> None:
-    print("[3/6] waiting daemon ready (modem + grpc + artc) ...", file=sys.stderr)
-    needles = ("modem_registered", "grpc_connected", "artc_loaded")
+    print("[3/6] waiting daemon ready (modem + grpc + dingrtc) ...", file=sys.stderr)
+    needles = ("READY:modem_registered", "READY:grpc_connected", "READY:dingrtc_loaded")
     seen = set()
     deadline = time.time() + timeout
     last_pos = 0
@@ -149,9 +243,10 @@ def step_trigger_campaign(args) -> None:
             "  ✗ ISALES_ADMIN_TOKEN env 未设 — 跑 curl POST /api/auth/login "
             "拿 access_token 后 export"
         )
+    header = f"Authorization: Bearer {token}"
     cmd = (
         f"curl -sS -X POST http://127.0.0.1/api/campaigns/{args.campaign_id}/start "
-        f"-H 'Authorization: Bearer {shlex.quote(token)}' -w '%{{http_code}}'"
+        f"-H {shlex.quote(header)} -w '%{{http_code}}'"
     )
     out = run_ssh(ssh_host=args.ssh_host, ssh_key=args.ssh_key, remote_cmd=cmd)
     if "200" not in out and "201" not in out and "202" not in out:
@@ -170,12 +265,14 @@ def step_poll_call_record(args) -> dict:
         sql = (
             f"SELECT id, status, started_at, ended_at, duration, transcript "
             f"FROM call_record WHERE lead_id = {args.lead_id} "
+            f"AND created_at > now() - interval '3 minutes' "
             f"ORDER BY id DESC LIMIT 1;"
         )
         out = run_ssh(
             ssh_host=args.ssh_host,
             ssh_key=args.ssh_key,
             remote_cmd=f"sudo -u postgres psql -d isales -tA -F '|' -c \"{sql}\"",
+            retries=2,
         )
         line = out.strip().split("\n")[0] if out.strip() else ""
         if not line:
@@ -189,7 +286,7 @@ def step_poll_call_record(args) -> dict:
         if status != last_status:
             print(f"  call_record.id={call_id} status={status}", file=sys.stderr)
             last_status = status
-        if status in ("ended", "completed", "failed"):
+        if status in ("end", "completed", "failed"):
             try:
                 transcript = json.loads(transcript_raw)
             except json.JSONDecodeError:
@@ -204,7 +301,54 @@ def step_poll_call_record(args) -> dict:
                 "transcript_first": transcript[0] if transcript else None,
             }
         time.sleep(2)
-    sys.exit(f"  ✗ poll timeout {args.timeout}s; last status={last_status}")
+    # -- timeout diagnostics --
+    diag_lines = []
+    # a) lead current status
+    sql = f"SELECT status FROM lead WHERE id = {args.lead_id}"
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f'sudo -u postgres psql -d isales -tA -c "{sql}"',
+        retries=2,
+    )
+    diag_lines.append(f"lead.status={out.strip()}")
+
+    # b) device status
+    sql = (
+        "SELECT d.id, d.status FROM device d "
+        "JOIN campaign_device cd ON cd.device_id = d.id "
+        f"WHERE cd.campaign_id = {args.campaign_id}"
+    )
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f'sudo -u postgres psql -d isales -tA -F "|" -c "{sql}"',
+        retries=2,
+    )
+    diag_lines.append(f"devices={out.strip()}")
+
+    # c) Redis queue lengths
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd=f"{REDIS_CLI} LLEN engine:dial && {REDIS_CLI} LLEN engine:dlq",
+        retries=2,
+    )
+    diag_lines.append(f"engine:dial/dlq len={out.strip()}")
+
+    # d) scheduler recent logs
+    out = run_ssh(
+        ssh_host=args.ssh_host,
+        ssh_key=args.ssh_key,
+        remote_cmd="journalctl -u isales-scheduler --since '2min ago' --no-pager | grep -E 'dispatch|tick|skip' | tail -5",
+        retries=2,
+    )
+    diag_lines.append(f"scheduler_log:\n    {out.strip()}")
+
+    sys.exit(
+        f"  ✗ poll timeout {args.timeout}s; last status={last_status}\n"
+        f"  === DIAGNOSTICS ===\n  " + "\n  ".join(diag_lines)
+    )
 
 
 def step_listen_confirm(record: dict) -> bool:
@@ -245,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     step_preflight(args)
+    step_verify_prerequisites(args)
     daemon_proc = step_start_daemon(args)
     try:
         if not args.dry_run:

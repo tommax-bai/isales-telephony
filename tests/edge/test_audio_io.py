@@ -74,12 +74,15 @@ async def test_playback_pump_drains_until_ring_closed() -> None:
     await ring.put(b"y" * 160)
 
     pump = asyncio.create_task(run_playback_pump(ring, play))
-    # Wait for both chunks to be consumed.
+    # The pump coalesces to one full 320-byte modem frame (20ms @ 8kHz)
+    # before writing — partial writes (<320B) block the SIM7600 USB CDC
+    # endpoint — so two 160-byte chunks become a single 320-byte write.
     for _ in range(50):
-        if len(play.written) == 2:
+        if len(play.written) == 1:
             break
         await asyncio.sleep(0.01)
-    assert len(play.written) == 2
+    assert len(play.written) == 1
+    assert play.written[0] == b"x" * 160 + b"y" * 160
 
     # Close the ring → pump exits, playback NOT closed (HW-scoped).
     await ring.close()

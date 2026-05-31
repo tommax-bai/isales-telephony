@@ -70,10 +70,15 @@ async def run_playback_pump(
 ) -> None:
     """Pull from ``downstream`` and write to ``playback`` until close.
 
-    Exits when :meth:`PcmRingBuffer.get` raises :class:`StopAsyncIteration`
-    (ring closed + empty) or the task is cancelled. As with the capture
-    pump, the ``playback`` backend is not closed here — orchestrator-owned.
+    Accumulates chunks to at least MIN_WRITE_BYTES before writing to the
+    modem serial port. SIM7600 expects 20ms frames = 320 bytes (8kHz
+    mono int16). Writing less than a full frame may block the USB CDC
+    endpoint indefinitely.
     """
+    # SIM7600 native frame: 160 samples × 2 bytes = 320 bytes (20ms @ 8kHz)
+    MIN_WRITE_BYTES = 320
+    _pb_count = 0
+    _accum = bytearray()
     try:
         while True:
             try:
@@ -83,7 +88,18 @@ async def run_playback_pump(
                 return
             if not chunk:
                 continue
-            await playback.write_chunk(chunk)
+            _accum.extend(chunk)
+            # Flush when we have at least one full modem frame
+            while len(_accum) >= MIN_WRITE_BYTES:
+                frame = bytes(_accum[:MIN_WRITE_BYTES])
+                del _accum[:MIN_WRITE_BYTES]
+                _pb_count += 1
+                if _pb_count <= 3 or _pb_count % 200 == 0:
+                    logger.info(
+                        "playback_pump_write n=%d bytes=%d",
+                        _pb_count, len(frame),
+                    )
+                await playback.write_chunk(frame)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001
