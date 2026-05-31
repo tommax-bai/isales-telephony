@@ -444,29 +444,85 @@ play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传
   与 modem 无关。
 - edge 代码层:capture→upstream ring→`_up_resampler`(scipy resample_poly
   8k→16k)→`push_audio`→DingRTC,整条 wiring 与重采样都对(代码读过,无明显 bug)。
-- **真凶候选(待新 edge 日志精确定位是哪一条):**
-  (a) 【头号】`bridge.py::_upstream_loop` line ~229 的 `except Exception` 兜底:
-  `push_audio` 抛 `RtcError`(DingRtcError,session.py:431)**不被内层 while
-  捕获** → 冒泡到这里 → 打一行 `audio_bridge_upstream_unexpected_error` →
-  **整个上行 pump 退出,这通剩下时间上行全死**(下行照常)→ 完美吻合
-  "AI→电话通 / 电话→AI 不通"。
-  (b) **旧 build 日志**(`%APPDATA%\isales\logs\telephony.log`):10:56 那次
-  join 的是 `MacosRtcSession`(旧 build 没接 factory,orchestrator 默认值),
-  根本没连真 DingRTC;且 `capture_pump_eof` 在 join 后 135ms 秒退。当前代码
-  `get_default_rtc_session_factory` win32 只返回 `WindowsDingRtcSession`(无
-  Macos fallback),此 bug 应已修 —— 但**日志混着旧 build,不能代表当前代码**。
-  (c) 11:21 最近一次:`cpcmreg_enable_failed` → 立刻挂断(但裸 `AT+CPCMREG=1`
-  当前手测 OK;疑似当时 modem 状态 / 时序)。
+- **【2026-05-31 23:19 全栈真拨 call_record #97 实测 — 头号假设证伪,上行 pump
+  在当前 daemon【工作】】** daemon 日志:`dingrtc_join_result rc=0 channel=97
+  uid=edge-97`(`WindowsDingRtcSession`,非 Macos)→ `audio_bridge_joined` →
+  **`upstream_push n=1000 bytes=640000`**(上行一路推了 640KB)+ `duplex_pump
+  n=1000` + `downstream_frame uid=engine-97 rate=48000`,**全程无
+  `audio_bridge_upstream_unexpected_error`、无 RtcError**。即原"上行 pump 一抛
+  RtcError 整通退出"(旧头号候选 a)**在当前正确接好的 daemon 没发生**,作废。
+- **但 call #97 transcript 仍 = `greeting`→`silence_activation`×2→
+  `silence_max_reached`(引擎仍静音)。⚠️ 关键 caveat:这通用户在打字、大概率
+  没对电话出声**,所以引擎收静音很可能"本来就没人说话",非 bug。**此通对"真人声
+  能否到引擎"既不证实也不证伪。**
+- **dev 启动缺口(真实 bug,记下):** daemon 直接 `python -m
+  isales_telephony.main_windows` 会 **`dingrtc_pywrap DLL load failed` 崩**——
+  main_windows **没 wire DingRTC vendor DLL 目录**(production frozen exe 靠
+  co-locate 规避)。dev 跑必须用 `_run_daemon_dev.py`(加了
+  `os.add_dll_directory(vendor/lib/x64)`)。要么长期补 main_windows 的 DLL wiring。
+- **残余候选(仅当"真说话仍静音"才查):** ① 推上去的是不是静音 ——
+  `run_duplex_pump` **当前不打振幅**,看不出采到有没有人声 → 需补 amp 日志(或信
+  `capture_downlink.py` 已证模组采得到人声);② RTC→引擎解码端格式/采样率;
+  ③ 引擎是否真订阅 edge 流。
 
-**➡️ 决定性下一步:** 用**当前代码**全栈真拨一通(modem 已干净),抓新日志看
-三件事:① join 的是不是 `WindowsDingRtcSession`;② 有没有 `upstream_push n=...`
-(上行真推了)还是 `audio_bridge_upstream_unexpected_error`(pump 死了);
-③ 引擎侧收没收到。在此之前不要再据旧日志下结论。
+**➡️ 决定性下一步:** 真拨一通、**全程对 13301035545 持续说话 ~15s**(之前几通都
+没真对电话出声,这是关键变量),再看 call_record transcript:出现非空 `text`/
+AI 回应你说的话 = 上行通;仍 `silence_activation` = 上行内容到不了引擎,再查残余候选。
 
-**诊断脚本(仓根):** `enum_mi04_endpoints.py`(端点枚举)、`capture_downlink.py`
-(下行采集+8k/16k WAV)、`diag_duplex_collapse.py`(P1纯读 vs P2读写对比)、
-`_probe_audio_cfg.py`(音频路由 AT 配置)。当前真机:AT=COM12/AUDIO=COM11/
-DIAG=COM10(认 description,重插必变)。
+## 音频诊断脚本清单 + 全栈真拨测试操作手册（免得每个 session 重问）
+
+当前真机 COM(认 description,**重插必变**,代码用 `discover_modem_serial_paths()`):
+**AT=COM12 / AUDIO=COM11 / DIAG=COM10**。所有脚本用 `.venv-3.12` 跑
+(`C:\Users\tianx\codes\isales-telephony\.venv-3.12\Scripts\python.exe`)。
+
+### A. 单脚本诊断(不经云端,直接驱 modem)
+
+| 脚本(仓根) | 作用 | 跑法 |
+|---|---|---|
+| `_probe_audio_cfg.py` | 非破坏性读 modem 音频路由/采样率/增益 AT 配置(CSDVC/CPCMFRM/CPCMBANDWIDTH…) | `python _probe_audio_cfg.py`(改端口在文件里) |
+| `enum_mi04_endpoints.py` | pyusb 只读枚举 modem USB 端点(证 MI_04 有 IN+OUT 两根 bulk) | `python enum_mi04_endpoints.py`(需 `pip install pyusb libusb-package`) |
+| `capture_downlink.py` | **测下行**:拨号→读 COM11→报字节率+振幅、存 8k/16k WAV。对端要说话 | `python capture_downlink.py --phone 13301035545 --at COM12 --audio COM11 --secs 10` |
+| `diag_duplex_collapse.py` | 测"写会不会塌下行读":一通两段 P1纯读 vs P2读+写静音。对端全程说话 | `python diag_duplex_collapse.py --phone 13301035545 --at COM12 --audio COM11` |
+| `retest_audio_write.py` / `diag_com11_audio.py` | (旧)上行写可用性 + 读写×端口四方向探针 | 见文件头 |
+
+### B. 全栈真拨测试（modem→RTC→engine→AI 闭环,测"电话→AI")
+
+**目的:** 验证对端真人声经 edge 上行送进引擎、AI 能听懂。判读 = call_record
+transcript 里出现非空 `text`/AI 回应你说的内容(通);仍 `silence_activation`(不通)。
+
+1. **spot-check modem 健康**(`_probe_audio_cfg.py` 看 AT OK、CSQ 有信号)。ECS
+   4 服务 active:`ssh -i isales-4.pem root@121.89.85.150 "systemctl is-active isales-api isales-engine isales-scheduler isales-worker"`。
+2. **起 daemon**(headless,**必须用 launcher**——直接 `-m main_windows` 会因
+   DingRTC DLL 未 wire 而崩):
+   ```
+   cd C:\Users\tianx\codes\isales-telephony
+   .\.venv-3.12\Scripts\python.exe -u _run_daemon_dev.py > edge_daemon_test.log 2>&1
+   ```
+   等日志出 4 个 READY:`modem_registered` / `audio_port_opened` /
+   `dingrtc_loaded` / `grpc_connected`。(后台跑时别用会退出的 wrapper 套
+   `&`——wrapper 一退 daemon 被 SIGHUP 带走;直接让 python 进程做后台任务。
+   重启前先杀干净旧 daemon,否则新 daemon 抢不到 COM 口报 "modem wedged"。)
+3. **复位测试数据**(测试任务 campaign=1 / lead=2=13301035545 / device=3):
+   ```
+   ssh -i isales-4.pem root@121.89.85.150 "sudo -u postgres psql -d isales -c \"UPDATE device SET status='idle' WHERE id=3; UPDATE lead SET status='new', next_call_at=NULL, retry_count=0, follow_up_count=0 WHERE id=2;\""
+   ```
+   (device 3 会卡 `dialing`——心跳不复位它,必须 SQL 改;否则 scheduler 不派发。)
+4. **触发 campaign start**(ECS 上用 JWT secret 签临时 admin token,只在 ECS 内用):
+   ```
+   ssh -i isales-4.pem root@121.89.85.150 "cd /opt/isales/current/isales-api; set -a; . /etc/isales/env/api.env; set +a; TOKEN=\$(/opt/isales/current/venv/bin/python -c \"from isales_api.auth.jwt import sign_jwt; print(sign_jwt({'sub':'t','role':'admin'}))\"); curl -sS -w ' http=%{http_code}\n' -X POST http://127.0.0.1/api/campaigns/1/start -H \"Authorization: Bearer \$TOKEN\""
+   ```
+   (或 isales-web 后台点「启动测试任务」。无 manual-dial API,只能走 campaign 派发。)
+5. **接 13301035545 + 全程对 AI 持续说话 ~15s**(关键变量——不说话引擎必然收静音,
+   测了等于白测)。
+6. **判读**:
+   - daemon `edge_daemon_test.log` 上行签名:`upstream_push n=… bytes=…`(上行在推)
+     / `audio_bridge_upstream_unexpected_error`(pump 死了)/ `capture_pump_eof`
+     (采集秒退)/ join 的是 `WindowsDingRtcSession` 还是 `MacosRtcSession`。
+   - 引擎侧:`ssh … "sudo -u postgres psql -d isales -tA -c \"SELECT transcript FROM call_record ORDER BY id DESC LIMIT 1;\""`,看有没有非空 `text`。
+
+**已知陷阱:**(a)`main_windows` 缺 DingRTC DLL wiring → 用 `_run_daemon_dev.py`;
+(b)孤儿 daemon 占 COM 口 → 重启前 `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ? CommandLine -match '_run_daemon_dev' | % { Stop-Process $_.ProcessId -Force }`;
+(c)prod DB 写 / 签 admin token 触发 campaign,Claude 自动模式分类器会拦——需用户当场授权或用户自己用 `!` 跑;(d)每通拨完 lead 2 状态会变,重测前重跑第 3 步复位。
 
 ## Cloud-edge gRPC smoke (Windows → ECS, verified 2026-05-17 23:25 CST)
 
