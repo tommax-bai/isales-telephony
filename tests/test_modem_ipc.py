@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -15,6 +16,15 @@ from isales_telephony.modem_controller.handlers import default_mock_handlers
 from isales_telephony.modem_controller.ipc_server import (
     MAX_FRAME_BYTES,
     IPCServer,
+)
+
+# modem-controller IPC is an AF_UNIX-socket feature (Linux/macOS edge);
+# asyncio has no unix-socket server/connection support on Windows
+# (ProactorEventLoop), so these tests can only run on POSIX. The Windows
+# edge uses a different integration and does not exercise this IPC path.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="AF_UNIX asyncio server/connection unsupported on Windows",
 )
 
 

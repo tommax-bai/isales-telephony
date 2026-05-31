@@ -194,23 +194,57 @@ async def test_connect_send_receive_disconnect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bad_token_keeps_retrying_until_stopped() -> None:
-    """A wrong token causes the server to abort with UNAUTHENTICATED.
-    The client treats this as a transient stream error and keeps
-    retrying (the operator's job to fix the token). The test verifies
-    is_connected stays False and start() blocks until the deadline /
-    stop()."""
+async def test_bad_token_keeps_retrying_until_stopped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wrong token causes the server to abort with UNAUTHENTICATED. The
+    client treats this as a transient stream error and keeps retrying (the
+    operator's job to fix the token).
+
+    We assert the *stable* contract — repeated UNAUTHENTICATED stream errors,
+    i.e. the client never holds a usable connection — rather than an
+    instantaneous ``is_connected`` read. grpc.aio's ``initial_metadata()`` can
+    return before the auth abort propagates, so ``_connected`` may flicker
+    True for microseconds on each retry, which makes a point-in-time check
+    racy (it depends on where in the ~0.1s retry cycle the assertion lands).
+    """
+    import logging
+
+    caplog.set_level(
+        logging.INFO, logger="isales_telephony.transport.grpc_client",
+    )
     server, _, target = await _start_server(accepted_tokens={"right"})
     client = CloudEdgeGrpcClient(initial_backoff_s=0.05, max_backoff_s=0.1)
     try:
-        # Don't await start indefinitely — it would hang. Use a tight
-        # timeout, then assert we're still NOT connected.
+        # Don't await start indefinitely — it would hang. Drive the retry
+        # loop for a tight window, then assert on the logged auth failures.
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(
                 client.start(target, "wrong"),
                 timeout=0.5,
             )
-        assert client.is_connected is False
+
+        # start() may return on the brief _connected flicker (grpc.aio's
+        # initial_metadata() can resolve before the auth abort propagates),
+        # so the UNAUTHENTICATED error is logged ASYNCHRONOUSLY a moment
+        # later. The retry loop re-fails auth every ~0.1s, so poll a bounded
+        # window — the error WILL appear; this is deterministic, unlike a
+        # one-shot check.
+        def _unauth() -> list:
+            return [
+                r for r in caplog.records
+                if r.getMessage().startswith("cloud_edge_stream_error")
+                and "UNAUTHENTICATED" in r.getMessage()
+            ]
+
+        for _ in range(50):  # up to ~1s
+            if _unauth():
+                break
+            await asyncio.sleep(0.02)
+        assert _unauth(), (
+            "expected ≥1 UNAUTHENTICATED cloud_edge_stream_error (bad token → "
+            "keep retrying, never a stable connection); saw none"
+        )
     finally:
         await client.stop()
         await server.stop(grace=0.1)
