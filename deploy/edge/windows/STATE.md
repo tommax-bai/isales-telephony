@@ -376,6 +376,44 @@ diag Phase D 实测单句柄并发读写可行)。`windows_serial_pcm.py` 的
 play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传坑
 见上文,如需重建按描述即可。
 
+## SIM7600 USB audio 全双工 — Windows 共享句柄硬墙 (2026-05-31)
+
+**真拨 13301035545 端到端实测里程碑 + 一堵硬墙。**
+
+**✅ 已通(实测)：**
+- AT 控制面可靠性修复：`pyserial-asyncio` 在 Windows ProactorEventLoop 下间歇
+  丢 modem 响应(~80% daemon 启动崩 init / 通话 URC 丢)；改用**裸 pyserial +
+  专用读线程**(`modem_controller/platforms/windows_serial_at.py::open_threaded_serial`,
+  `at_client.create_from_tty` Windows 分支)→ init 稳定、GMM 正确识别 SIM7600。
+- **下行(引擎 AI → 对端)完全通：真人电话里听到 AI 开场白**
+  ("您好，我是智联招聘的小雨…")。modem 自动发现 + gRPC + 派发 + RTC join +
+  下行音频全链路工作。
+
+**❌ 上行(对端 → AI)卡死 = 硬墙：**
+- 现象：引擎全程只收到静音(call_record transcript:`silence_activation` →
+  `hangup silence_max_reached`),即便边缘 capture+push 了 ~1.5MB。
+- 根因(穷尽验证)：**Windows 上对共享音频 COM 句柄(COM17)只要一写,下行读
+  就从 16320 B/s 塌到 640 B/s(1/25)并静音。** 纯读(不写)= 16320 B/s、对端
+  说话 amp~4000 清晰。试过的全部 read+write 写法**无一例外**:并发双线程 /
+  顺序读写 / 平衡 lockstep(读N写N)/ echo 参考精确模式(`timeout=0` 非阻塞
+  紧凑循环)。证据脚本:`read_farend_amp.py`(纯读 OK)、`read_amp_echo.py`
+  (全双工塌)。
+- 性质:**不是 pacing 问题**,是 Windows 串口独占句柄 + 这个 modem 的 USB
+  端点在一个句柄上做不了真全双工。能跑通的 `elementzonline/GSMModem`
+  echo 参考是 **Linux**(内核 option/qcserial 驱动栈不同)。
+
+**➡️ 出路(未实现,下一轮):**
+- **A**:`pyusb` + WinUSB(Zadig 把 MI_04 从 COM 驱动换成 WinUSB)直接读写
+  音频接口的 **bulk IN / bulk OUT 两个独立端点** = 真全双工。**先决条件**:
+  确认 MI_04 是否有分开的 IN+OUT bulk 端点(USBView / pyusb enumerate);
+  若只有一个共享端点 → 该模块在 Windows 本质半双工,只能走 B。
+- **B**:边缘改 Linux(全双工已知可行)。
+
+**代码现状**:`audio_io.py::run_duplex_pump`(单任务全双工 pump 结构)+
+orchestrator Windows 分支已就位 —— pump 结构是对的,坏的是底层 COM 传输;
+未来 pyusb 后端可直接接这个 pump。`windows_serial_pcm.py::adopt_serial_from`
+(共享句柄)在全双工下证伪,pyusb 后端落地后应替换。
+
 ## Cloud-edge gRPC smoke (Windows → ECS, verified 2026-05-17 23:25 CST)
 
 The Windows dev box can reach ECS `121.89.85.150:50051` over plain

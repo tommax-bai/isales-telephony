@@ -251,15 +251,30 @@ class SerialATClient:
             BusyDeviceError: another process holds the tty lock.
             RuntimeError: the tty cannot be opened (permission / not present).
         """
-        import serial_asyncio  # type: ignore[import-untyped]
+        import sys  # noqa: PLC0415
 
         from isales_telephony.modem_controller.drivers import detect_driver
         from isales_telephony.modem_controller.serial_protocol import AtClient
 
         try:
-            reader, writer = await serial_asyncio.open_serial_connection(
-                url=tty_path, baudrate=baudrate
-            )
+            if sys.platform == "win32":
+                # pyserial-asyncio's reader is unreliable on Windows
+                # (ProactorEventLoop has no working add_reader for serial
+                # handles), intermittently dropping modem responses →
+                # AtTimeoutError on init + dropped in-call URCs. Use a
+                # blocking-pyserial reader thread instead. See
+                # platforms/windows_serial_at.py.
+                from isales_telephony.modem_controller.platforms.windows_serial_at import (  # noqa: PLC0415
+                    open_threaded_serial,
+                )
+
+                reader, writer = await open_threaded_serial(tty_path, baudrate)
+            else:
+                import serial_asyncio  # type: ignore[import-untyped]  # noqa: PLC0415
+
+                reader, writer = await serial_asyncio.open_serial_connection(
+                    url=tty_path, baudrate=baudrate
+                )
         except Exception as exc:  # noqa: BLE001 — classify before surfacing
             # Windows OS-level exclusive open conflict surfaces as
             # PermissionError / "Access is denied" SerialException; map

@@ -65,7 +65,11 @@ from isales_common.audio.rtc import RtcSession
 from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
 from isales_telephony.audio_bridge.session import MacosRtcSession
-from isales_telephony.edge.audio_io import run_capture_pump, run_playback_pump
+from isales_telephony.edge.audio_io import (
+    run_capture_pump,
+    run_duplex_pump,
+    run_playback_pump,
+)
 from isales_telephony.modem_controller.at_client import (
     ATClient,
     ATEvent,
@@ -454,18 +458,34 @@ class EdgeOrchestrator:
             await self._handle_remote_hangup(ctx, cause="network_out_of_order")
             return
 
-        ctx.tasks.append(
-            asyncio.create_task(
-                run_capture_pump(self._capture, upstream),
-                name=f"capture_pump_{ctx.call_id}",
+        import sys  # noqa: PLC0415
+
+        if sys.platform == "win32":
+            # Windows: capture + playback share ONE serial handle (the audio
+            # COM port can't be opened twice). Two concurrent pumps corrupt
+            # the read, so drive both directions from a single lockstep task.
+            # See run_duplex_pump.
+            ctx.tasks.append(
+                asyncio.create_task(
+                    run_duplex_pump(
+                        self._capture, self._playback, upstream, downstream,
+                    ),
+                    name=f"duplex_pump_{ctx.call_id}",
+                )
             )
-        )
-        ctx.tasks.append(
-            asyncio.create_task(
-                run_playback_pump(downstream, self._playback),
-                name=f"playback_pump_{ctx.call_id}",
+        else:
+            ctx.tasks.append(
+                asyncio.create_task(
+                    run_capture_pump(self._capture, upstream),
+                    name=f"capture_pump_{ctx.call_id}",
+                )
             )
-        )
+            ctx.tasks.append(
+                asyncio.create_task(
+                    run_playback_pump(downstream, self._playback),
+                    name=f"playback_pump_{ctx.call_id}",
+                )
+            )
 
     # ===== Dev-no-modem flow (macOS dev / QA, no GSM modem) =============
 

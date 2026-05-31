@@ -75,12 +75,19 @@ def _required_env(name: str) -> str:
     return val
 
 
-def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
+def _build_audio_backends(
+    audio_path: str | None = None,
+) -> tuple[CaptureBackend, PlaybackBackend]:
     """Resolve modem-side capture / playback backends from env.
 
     v1.0 (A2) ships macOS Core Audio backends; Linux ALSA is reserved
     for the dev/CI fallback. Returns the already-open backends — they
     are HW-scoped, not per-call.
+
+    ``audio_path`` (Windows only): a pre-discovered Audio COM path. When
+    given, the windows backend skips its own discovery — the caller has
+    already discovered (and is holding the AT port), so a second discovery
+    here would fail to re-probe the now-busy AT channel.
     """
     backend = os.environ.get("ISALES_EDGE_AUDIO_BACKEND", "macos")
     if backend == "macos":
@@ -116,12 +123,13 @@ def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
         # MUST share ONE handle on the Audio port: Windows COM ports are
         # exclusive, and uplink to the Diagnostics port (COM10) was proven
         # SILENT (2026-05-31). See deploy/edge/windows/STATE.md.
-        try:
-            _at_path, audio_path = discover_modem_serial_paths()
-        except ModemDiscoveryError as exc:
-            raise RuntimeError(
-                f"windows audio backend: modem auto-discovery failed: {exc}"
-            ) from exc
+        if audio_path is None:
+            try:
+                _at_path, audio_path = discover_modem_serial_paths()
+            except ModemDiscoveryError as exc:
+                raise RuntimeError(
+                    f"windows audio backend: modem auto-discovery failed: {exc}"
+                ) from exc
         capture = WindowsSerialPcmCapture(audio_path)
         playback = WindowsSerialPcmPlayback(audio_path)
         capture.open_port()
@@ -200,9 +208,32 @@ async def _arun_real(args: argparse.Namespace) -> None:
     if not device_id:
         logger.warning("ISALES_DEVICE_ID not set; gRPC heartbeat will be disabled")
 
-    at_client = await _make_at_client()
-    capture, playback = _build_audio_backends()
+    # Windows: auto-discover AT + Audio COM ports ONCE (no env COM — numbers
+    # re-enumerate every re-plug). The AT client then HOLDS the AT port, so a
+    # second discovery couldn't re-probe it — hence pass the discovered
+    # audio_path straight to _build_audio_backends.
+    if os.environ.get("ISALES_EDGE_AUDIO_BACKEND", "macos") == "windows":
+        from isales_telephony.modem_controller.at_client import SerialATClient
+        from isales_telephony.modem_controller.platforms.windows_serial import (
+            ModemDiscoveryError,
+            discover_modem_serial_paths,
+        )
+
+        try:
+            at_path, audio_path = discover_modem_serial_paths()
+        except ModemDiscoveryError as exc:
+            raise RuntimeError(f"modem auto-discovery failed: {exc}") from exc
+        logger.info("modem auto-discovered at=%s audio=%s", at_path, audio_path)
+        at_client = await SerialATClient.create_from_tty(
+            at_path, driver_hint=os.environ.get("ISALES_MODEM_DRIVER", ""),
+        )
+        capture, playback = _build_audio_backends(audio_path=audio_path)
+    else:
+        at_client = await _make_at_client()
+        capture, playback = _build_audio_backends()
+    logger.info("audio_backends_built")
     event_buffer = _build_event_buffer()
+    logger.info("connecting_grpc endpoint=%s", endpoint)
 
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     orchestrator = EdgeOrchestrator(

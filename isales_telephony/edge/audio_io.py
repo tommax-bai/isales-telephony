@@ -49,13 +49,31 @@ async def run_capture_pump(
     close ``capture`` on exit — the orchestrator owns its lifecycle so
     one backend can survive across multiple calls.
     """
+    _cap_count = 0
+    _cap_bytes = 0
     try:
         while True:
             chunk = await capture.read_chunk()
             if not chunk:
                 # EOF from the backend — exit cleanly.
-                logger.info("capture_pump_eof")
+                logger.info("capture_pump_eof n=%d bytes=%d", _cap_count, _cap_bytes)
                 return
+            _cap_count += 1
+            _cap_bytes += len(chunk)
+            if _cap_count <= 3 or _cap_count % 50 == 0:
+                # max abs int16 sample — distinguishes true silence (~0) from
+                # captured far-end voice (thousands). If this stays ~0 while
+                # the caller speaks, the modem isn't routing GSM-RX audio into
+                # the USB PCM downlink (a modem audio-path config issue).
+                try:
+                    import audioop  # noqa: PLC0415
+                    amp = audioop.max(chunk, 2)
+                except Exception:  # noqa: BLE001
+                    amp = -1
+                logger.info(
+                    "capture_pump_read n=%d bytes=%d last=%d amp=%d",
+                    _cap_count, _cap_bytes, len(chunk), amp,
+                )
             await upstream.put(chunk)
     except asyncio.CancelledError:
         raise
@@ -107,4 +125,63 @@ async def run_playback_pump(
         raise
 
 
-__all__ = ["run_capture_pump", "run_playback_pump"]
+async def run_duplex_pump(
+    capture: CaptureBackend,
+    playback: PlaybackBackend,
+    upstream: PcmRingBuffer,
+    downstream: PcmRingBuffer,
+) -> None:
+    """Single-task FULL-DUPLEX pump for a shared serial handle (Windows).
+
+    Windows cannot open the SIM7600 audio COM port twice, so capture (read)
+    and playback (write) share ONE pyserial handle. Running them as two
+    independent concurrent pumps (separate threads) corrupts the read — the
+    write collides with it and the captured far-end audio comes back as
+    silence/garbage (2026-05-31: pure-read amp ~4000 while the caller speaks,
+    but concurrent read+write amp ~0). So on Windows both directions are driven
+    from ONE task in lockstep: read one frame (the blocking read paces the loop
+    at the modem's 8 kHz clock), then write one frame — never both at once.
+
+    macOS/Linux keep the separate capture+playback pumps (independent in/out
+    devices, no shared handle).
+    """
+    FRAME = 320  # 20 ms @ 8 kHz int16 mono
+    SILENCE = b"\x00" * FRAME
+    pending = bytearray()  # downstream (engine/AI voice) accumulator
+    _n = 0
+    try:
+        while True:
+            # 1. READ one uplink frame from the modem (blocks ~20 ms → paces).
+            chunk = await capture.read_chunk()
+            if not chunk:
+                logger.info("duplex_pump_eof n=%d", _n)
+                return
+            await upstream.put(chunk)
+            # 2. Drain whatever downstream (AI voice) is ready — non-blocking.
+            while True:
+                out = downstream.get_nowait()
+                if out is None:
+                    break
+                pending.extend(out)
+            # 3. WRITE one frame (AI voice, or silence to keep the PCM clock fed
+            #    so the modem keeps streaming the downlink we read in step 1).
+            if len(pending) >= FRAME:
+                frame = bytes(pending[:FRAME])
+                del pending[:FRAME]
+            else:
+                frame = SILENCE
+            await playback.write_chunk(frame)
+            _n += 1
+            if _n <= 3 or _n % 100 == 0:
+                logger.info(
+                    "duplex_pump n=%d up_last=%d down_pending=%d wrote=%d",
+                    _n, len(chunk), len(pending), len(frame),
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("duplex_pump_unexpected_error")
+        raise
+
+
+__all__ = ["run_capture_pump", "run_duplex_pump", "run_playback_pump"]

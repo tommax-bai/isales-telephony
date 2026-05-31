@@ -216,6 +216,14 @@ class AudioBridge:
                         return
                 self.stats.upstream_chunks += 1
                 self.stats.upstream_bytes += len(resampled)
+                if self.stats.upstream_chunks <= 3 or self.stats.upstream_chunks % 100 == 0:
+                    logger.info(
+                        "upstream_push n=%d bytes=%d in=%d out=%d",
+                        self.stats.upstream_chunks,
+                        self.stats.upstream_bytes,
+                        len(chunk),
+                        len(resampled),
+                    )
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001
