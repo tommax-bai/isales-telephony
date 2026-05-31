@@ -8,9 +8,14 @@
 > - ❌ **仍未解的真 bug**:全栈真拨,引擎**全程只收到静音 → 因静音挂断**
 >   (call_record #96 transcript 实证:greeting 发出=下行通,之后全是
 >   `silence_activation`→`silence_max_reached`)。即 **modem 读得到对端声音,
->   但送不进引擎**。断点在 edge 上行 `capture→push_audio→RTC publish` 或引擎
->   订阅。头号嫌疑:`bridge.py::_upstream_loop` 的 `push_audio` 一抛 `RtcError`
->   就被外层 `except` 接住→**整通上行 pump 退出**(下行照常)。
+>   但送不进引擎**。
+> - **✅ 已锁定(call #98 fake-WAV 注入实测,见下方详节):** 用
+>   `ISALES_FAKE_CAPTURE_WAV` 绕开 modem、把已知真人语音当上行喂进 daemon,
+>   `upstream_push` 一路在推真语音、无 RtcError,**引擎照样只收到静音**。→ bug
+>   **不在 modem、不在上行 pump**(上行 pump 工作,旧"pump 一抛错就死"假设证伪),
+>   **在 `push_external_audio`→DingRTC 上行 publish→引擎接收**这一段(edge push
+>   返回成功但音频没成为引擎可听的已发布流)。下一步在 engine/DingRTC publish 侧查。
+> - **次要 bug:** 引擎挂断后 edge 没收到挂断、继续空推 + modem 通话不挂(烧钱)。
 > - **已被本轮证伪的旧结论(别再信):**(a)"写共享句柄→下行读塌到 640 B/s 的
 >   全双工硬墙"——`diag_duplex_collapse.py` 干净复测下行没塌;(b)"downlink
 >   ≈32KB/s 偏 16kHz"——实测 8kHz;(c)"出路 A 换 WinUSB/Zadig、出路 B 改
@@ -465,9 +470,29 @@ play_wav)已删,其结论已并入本节;CCMXPLAYWAV 备选与 `CFTRANRX` 上传
   `capture_downlink.py` 已证模组采得到人声);② RTC→引擎解码端格式/采样率;
   ③ 引擎是否真订阅 edge 流。
 
-**➡️ 决定性下一步:** 真拨一通、**全程对 13301035545 持续说话 ~15s**(之前几通都
-没真对电话出声,这是关键变量),再看 call_record transcript:出现非空 `text`/
-AI 回应你说的话 = 上行通;仍 `silence_activation` = 上行内容到不了引擎,再查残余候选。
+**✅ 决定性定位 — fake-WAV 注入实测(call_record #98,2026-05-31 23:31):**
+绕开 modem、用 `ISALES_FAKE_CAPTURE_WAV` 把已知**真人语音**(`downlink_8k.wav`,
+amp 2000-3500)当上行喂进 daemon。日志:`dingrtc_join_result rc=0 channel=98` +
+**`upstream_push` 从 23:31:01 起一路推真语音**(引擎首次 `silence_activation`
+在 +13.5s,之前已推十几秒语音)。**但 call #98 transcript 仍 =
+`greeting→silence_activation×2→silence_max_reached`,引擎照样只收到静音。**
+→ **bug 位置彻底锁定:不是 modem 采集(已旁路)、不是上行 pump(在推、无
+RtcError)、而是 `WindowsDingRtcSession.push_external_audio` → DingRTC 上行
+publish → 引擎接收这一段。** edge 侧 `push_audio` 返回成功(`upstream_push` 在
+AwaIT 成功后才计数,无 RtcError),但推的音频没成为引擎可听的已发布流。
+- **下一步(engine/DingRTC 侧):** ① engine 侧查有没有收到 edge-98 的 audio
+  observer 帧(收到=解码/VAD 问题;没收到=publish/subscribe 没接上);② 复核
+  edge join 的 publish 配置链 `enable_custom_audio_capture(True)` +
+  `set_external_audio_source(True,16000,1)` + `publish_local_audio_stream(True)` +
+  `push_external_audio` 是否真把外部源接到已发布 RTP 流(对照 cloud Linux
+  `DingRtcSession` 与 dual-peer smoke 的差异);③ 确认引擎 join 同信道且
+  `subscribe_all_remote_audio_streams`。
+- **次要 bug(同测发现):** 引擎 21s 挂断 call #98 后,**edge 没收到挂断**、继续
+  往死信道空推 2.5 分钟、modem 通话还连着(烧钱)。挂断不从 engine 传播到 edge,
+  需查 gRPC CallEvent(remote_hangup)/ RTC bye 的边缘处理。
+- **复测工具:** `_run_daemon_dev.py` + `ISALES_FAKE_CAPTURE_WAV=<8k mono wav>`
+  起 daemon(见 `windows_serial_pcm.py::WindowsSerialPcmCapture` 的 TEST-ONLY 钩子,
+  问题修复后应连同钩子一起删)。
 
 ## 音频诊断脚本清单 + 全栈真拨测试操作手册（免得每个 session 重问）
 

@@ -206,6 +206,26 @@ class _SerialPortHolder:
         self._opened = True
 
 
+def _load_wav_pcm_8k_mono(path: str) -> bytes:
+    """Load a WAV as raw 8 kHz mono int16 PCM (diagnostic fake-capture source).
+
+    Used ONLY by the ``ISALES_FAKE_CAPTURE_WAV`` test hook below.
+    """
+    import wave  # noqa: PLC0415
+
+    with wave.open(path, "rb") as w:
+        if (
+            w.getframerate() != SAMPLE_RATE_HZ
+            or w.getnchannels() != CHANNELS
+            or w.getsampwidth() != 2
+        ):
+            raise SerialPcmError(
+                f"fake capture WAV must be {SAMPLE_RATE_HZ}Hz mono int16; got "
+                f"{w.getframerate()}Hz {w.getnchannels()}ch {w.getsampwidth() * 8}bit"
+            )
+        return w.readframes(w.getnframes())
+
+
 class WindowsSerialPcmCapture(_SerialPortHolder):
     """Reads 8 kHz int16 mono PCM from the modem's audio COM port.
 
@@ -236,6 +256,26 @@ class WindowsSerialPcmCapture(_SerialPortHolder):
             timeout=timeout,
         )
         self._chunk_bytes = chunk_bytes
+        # Diagnostic hook (TEST-ONLY, remove once edge→RTC→engine upstream is
+        # verified): when ISALES_FAKE_CAPTURE_WAV points at an 8 kHz mono int16
+        # WAV, read_chunk yields frames from that file (looping, real-time
+        # paced) INSTEAD of the modem mic — lets us prove the upstream path
+        # delivers known audio to the engine without anyone speaking on the
+        # phone. The modem handle still opens (playback adopts it), so AI voice
+        # still reaches the far end.
+        import os  # noqa: PLC0415
+
+        self._fake_wav_pcm: bytes | None = None
+        self._fake_wav_pos = 0
+        _fake_path = os.environ.get("ISALES_FAKE_CAPTURE_WAV", "")
+        if _fake_path:
+            self._fake_wav_pcm = _load_wav_pcm_8k_mono(_fake_path)
+            logger.warning(
+                "serial_pcm: FAKE CAPTURE active — upstream fed from %s "
+                "(%d bytes), NOT the modem mic",
+                _fake_path,
+                len(self._fake_wav_pcm),
+            )
 
     async def read_chunk(self) -> bytes:
         """Block until ``chunk_bytes`` of PCM are available, then return.
@@ -253,6 +293,19 @@ class WindowsSerialPcmCapture(_SerialPortHolder):
         """
         if not self._opened:
             self.open_port()
+
+        # TEST-ONLY fake-capture hook (see __init__): feed upstream from a WAV.
+        if self._fake_wav_pcm is not None:
+            await asyncio.sleep(0.02)  # pace at ~real-time (20 ms / frame)
+            pcm = self._fake_wav_pcm
+            n = self._chunk_bytes
+            chunk = pcm[self._fake_wav_pos:self._fake_wav_pos + n]
+            self._fake_wav_pos += n
+            if len(chunk) < n:  # wrap around (loop the clip)
+                self._fake_wav_pos = n - len(chunk)
+                chunk = chunk + pcm[:self._fake_wav_pos]
+            return chunk
+
         ser = self._serial
         assert ser is not None
 
