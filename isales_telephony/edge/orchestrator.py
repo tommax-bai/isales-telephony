@@ -553,6 +553,12 @@ class EdgeOrchestrator:
 
         capture = MacMicCapture()
         ts_ms = 0
+        # DIAG-REMOVE-AFTER-MIC-DEBUG: per-second push count + bytes + max RMS
+        import time as _time  # noqa: PLC0415
+        _last_log_t = _time.monotonic()
+        _chunks_window = 0
+        _bytes_window = 0
+        _max_rms_window = 0
         try:
             capture.open()
             chunk_ms = capture.chunk_duration_ms
@@ -566,6 +572,37 @@ class EdgeOrchestrator:
                         ctx.call_id, exc,
                     )
                 ts_ms += chunk_ms
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ------------------------
+                _chunks_window += 1
+                _bytes_window += len(chunk)
+                if chunk and len(chunk) >= 2:
+                    _sample_count = len(chunk) // 2
+                    _stride = max(1, _sample_count // 32)
+                    _total = 0
+                    _seen = 0
+                    for _i in range(0, len(chunk), _stride * 2):
+                        if _i + 2 > len(chunk):
+                            break
+                        _s = int.from_bytes(chunk[_i:_i + 2], "little", signed=True)
+                        _total += _s * _s
+                        _seen += 1
+                    if _seen:
+                        _rms = int((_total // _seen) ** 0.5)
+                        if _rms > _max_rms_window:
+                            _max_rms_window = _rms
+                _now = _time.monotonic()
+                if _now - _last_log_t >= 1.0:
+                    logger.info(
+                        "dev_no_modem_mic_push_1s call_id=%s chunks=%s "
+                        "bytes=%s max_rms=%s ts_ms=%s",
+                        ctx.call_id, _chunks_window, _bytes_window,
+                        _max_rms_window, ts_ms,
+                    )
+                    _last_log_t = _now
+                    _chunks_window = 0
+                    _bytes_window = 0
+                    _max_rms_window = 0
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end --------------------------
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
