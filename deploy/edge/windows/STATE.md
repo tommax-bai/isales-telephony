@@ -26,6 +26,18 @@
 
 ## ⏭️ 会话交接 — 2026-05-31 收尾,明天续（可能换电脑,故记于此而非本机 memory）
 
+> **🚧 Fresh session 反误读警示(2026-06-01 教训补刻):** 如果你想答
+> "昨天 Windows DingRTC 卡在哪",**先读完本节、再去看 meta-repo**。
+> 同一天 meta-repo `isales` 提了一个名字看着相关的 propose
+> `openspec/changes/edge-modem-audio-out-recovery/`——**那是另一条独立
+> 路径**(host→modem→对端的下行播音方向 OUT 卡死),**不是**本节锁定的
+> bug(modem→edge→DingRTC publish→引擎接收的上行不通)。proposal 标题里
+> 的 "OUT" 在 SerialPcm 上下文是严格的 host-write 方向语义,望文生义当成
+> "电话出问题" 会把诊断引到完全反方向。证据:本节 + `e29e43e` (fake-WAV
+> 钩子锁定 publish→engine) / `fd74cdf` (硬墙证伪) / `a374a7f` (操作手册)
+> 三条 commit 全在本 sub-repo `origin/main`,meta-repo 一个都没。**iSales
+> 工程现场状态在 sub-repo,meta-repo 的 propose 是滞后影子。**
+
 **结论(已坐实,别回头质疑):** "电话→AI 没通" 的 bug **锁定在
 `WindowsDingRtcSession.push_external_audio` → DingRTC 上行 publish → 引擎接收**
 这一段。证据:fake-WAV 注入(`ISALES_FAKE_CAPTURE_WAV` 绕开 modem 喂已知真人语音),
