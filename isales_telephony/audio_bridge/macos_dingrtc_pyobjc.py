@@ -528,6 +528,32 @@ class _DingRtcAudioFrameDelegate(NSObject):  # type: ignore[misc,valid-type]
         else:
             pcm_bytes = b""
 
+        # 端输出 timing diag: per-second peak of the AI playback PCM reaching
+        # the edge (≈ when it renders to the mac speaker). Cheap 16-point peak
+        # (no audioop — removed in Py 3.14); aggregated per second.
+        if pcm_bytes and bytes_per_sample == 2:
+            import struct as _st  # noqa: PLC0415
+            import time as _t  # noqa: PLC0415
+            _n = len(pcm_bytes) // 2
+            _peak = 0
+            if _n:
+                _stride = max(1, _n // 16)
+                for _i in range(0, _n, _stride):
+                    _v = _st.unpack_from("<h", pcm_bytes, _i * 2)[0]
+                    if abs(_v) > _peak:
+                        _peak = abs(_v)
+            _now = _t.monotonic()
+            self._pb_peak = max(getattr(self, "_pb_peak", 0), _peak)
+            self._pb_cnt = getattr(self, "_pb_cnt", 0) + 1
+            if _now - getattr(self, "_pb_last", 0.0) >= 1.0:
+                logger.info(
+                    "dev_playback_recv_1s frames=%s peak=%s sr=%s ch=%s ts_ms=%s",
+                    self._pb_cnt, self._pb_peak, sample_rate, channels, timestamp_ms,
+                )
+                self._pb_last = _now
+                self._pb_peak = 0
+                self._pb_cnt = 0
+
         loop.call_soon_threadsafe(
             session._on_audio_frame,
             "", pcm_bytes, sample_rate, channels, timestamp_ms,
@@ -708,6 +734,17 @@ class MacosDingRtcPyObjCSession(RtcSession):
                 "loaded framework — wrong SDK version? Expected 3.9.x.",
             ) from exc
         self._engine = engine
+
+        # setAudioDenoise removed 2026-06-03: empirical 3-mode A/B/A test
+        # (OFF / DSP mode=1 / Enhance mode=2 with Gatekeeper-approved
+        # hbal_se.dylib) — engine inbound RMS baseline ~600-1700 in all 3
+        # modes (within env-noise variance). SDK accepts rc=True but
+        # external-audio-source mode (set_external_audio_source + push_
+        # external_audio) bypasses SDK internal NS pipeline. Conclusion:
+        # SDK denoise only processes its own mic-capture flow; iSales
+        # pushes raw PCM directly so we must do NS application-side or
+        # change interruption signal (planned: barge-in ASR-text-length
+        # threshold instead of VAD-energy).
 
         # Register the audio-frame delegate (separate protocol) +
         # enable the playback observe position (mixed downstream PCM).
