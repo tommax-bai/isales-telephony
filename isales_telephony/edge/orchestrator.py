@@ -58,10 +58,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyped]
+from isales_common.audio.rtc import RtcSession
 from isales_common.proto import cloud_edge_pb2 as pb
 from isales_common.transport.cloud_edge import CloudEdgeClient
-
-from isales_common.audio.rtc import RtcSession
 
 from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
@@ -76,7 +75,7 @@ from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
     PlaybackBackend,
 )
-
+from isales_telephony.modem_controller.recorder import DiskFullError, Recorder
 
 # AT command stage label for the HardwareAlert emitted when AT+CPCMREG=1
 # fails on call connect. Spec § "PCM 通道按 SIMCom AT 协议启停 (CPCMREG)"
@@ -130,6 +129,11 @@ class _CallContext:
     upstream: PcmRingBuffer | None = None
     downstream: PcmRingBuffer | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    # edge-local-call-recording: set in _handle_connected once begin_call
+    # succeeded for this call. teardown finalizes the wav + prunes the dir.
+    # None → recording was off / disk-full skipped for this call.
+    recorder: Recorder | None = None
+    max_recordings: int = 0
     # dev-no-modem path stashes the RtcSession directly (no AudioBridge
     # wrapping it, because there is no modem PCM stream to bridge to).
     # teardown() calls leave() on it like it would on bridge.
@@ -166,6 +170,16 @@ class _CallContext:
             with contextlib.suppress(Exception):
                 await self.bridge.leave()
             self.bridge = None
+        # edge-local-call-recording: bridge.leave() has stopped the pumps, so
+        # no more append_user / append_ai land after this. Finalize the wav
+        # and roll the dir to the newest N. Best-effort — a recording failure
+        # must never block call teardown.
+        if self.recorder is not None:
+            with contextlib.suppress(Exception):
+                self.recorder.finalize(self.call_id)
+            with contextlib.suppress(Exception):
+                self.recorder.prune(self.max_recordings)
+            self.recorder = None
         # dev-no-modem: rtc_session is owned directly, not via AudioBridge.
         if self.rtc_session is not None:
             with contextlib.suppress(Exception):
@@ -202,6 +216,10 @@ class EdgeOrchestrator:
         ring_capacity_bytes: per-call ring buffer cap. Default 32 KiB
             (~1 s @ 16 kHz mono int16) — well above the 200 ms spec
             floor for jitter absorption.
+        recorder: optional edge-local stereo recorder (edge-local-call-
+            recording). ``None`` (default) disables recording.
+        max_recordings: rolling retention — keep this many newest wavs in
+            the recorder's dir, prune the rest on each call teardown.
     """
 
     def __init__(
@@ -213,6 +231,8 @@ class EdgeOrchestrator:
         playback: PlaybackBackend | None = None,
         rtc_session_factory: RtcSessionFactory | None = None,
         ring_capacity_bytes: int = 32 * 1024,
+        recorder: Recorder | None = None,
+        max_recordings: int = 0,
         dev_no_modem: bool = False,
         dev_channel: str | None = None,
         dev_uid: str | None = None,
@@ -226,6 +246,12 @@ class EdgeOrchestrator:
             rtc_session_factory if rtc_session_factory is not None else MacosRtcSession
         )
         self._ring_capacity = ring_capacity_bytes
+        # edge-local-call-recording: a single shared recorder (single-modem =
+        # one call at a time, keyed by call_id). None → recording disabled.
+        # Only the modem path (AudioBridge) records; dev-no-modem has no
+        # downstream loop so the AI channel isn't reachable there.
+        self._recorder = recorder
+        self._max_recordings = max_recordings
         self._calls: dict[str, _CallContext] = {}
         # Audio capture / playback are HW-scoped, not per-call. The
         # active call's pumps are wired to the active call's ring
@@ -423,11 +449,29 @@ class EdgeOrchestrator:
             capacity_bytes=self._ring_capacity,
             name=f"modem_downstream_{ctx.call_id}",
         )
+        # edge-local-call-recording: begin recording before building the
+        # bridge so the pumps can tap PCM from their first frame. DiskFullError
+        # → skip recording for this call (logged); the call itself continues.
+        record_recorder: Recorder | None = None
+        if self._recorder is not None and self._max_recordings > 0:
+            try:
+                self._recorder.begin_call(ctx.call_id)
+                record_recorder = self._recorder
+                ctx.recorder = self._recorder
+                ctx.max_recordings = self._max_recordings
+            except DiskFullError as exc:
+                logger.warning(
+                    "recording_skipped_disk_full",
+                    extra={"call_id": ctx.call_id, "detail": str(exc)},
+                )
+
         bridge = AudioBridge(
             rtc_session=self._rtc_factory(),
             modem_upstream=upstream,
             modem_downstream=downstream,
             peer_uid=dial.rtc_uid_engine,
+            recorder=record_recorder,
+            record_call_id=ctx.call_id if record_recorder is not None else None,
         )
         ctx.upstream = upstream
         ctx.downstream = downstream

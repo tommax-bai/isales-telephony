@@ -37,7 +37,6 @@ import os
 import signal
 import sys
 from pathlib import Path
-
 from typing import TYPE_CHECKING
 
 from isales_telephony.ui.activation import (
@@ -193,6 +192,7 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
     from isales_telephony.audio_bridge.session import (  # noqa: PLC0415
         MacosRtcSession,
     )
+    from isales_telephony.edge.main import _build_recorder  # noqa: PLC0415
     from isales_telephony.edge.orchestrator import (  # noqa: PLC0415
         EdgeOrchestrator,
     )
@@ -220,6 +220,7 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
     playback = get_playback_class()()
 
     event_buffer = _build_event_buffer()
+    recorder, max_recordings = _build_recorder()
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     restarter = _GrpcClientRestarter(client=grpc_client, bus=state_bus)
 
@@ -229,6 +230,8 @@ async def _arun(*, stop_event: asyncio.Event, state_bus: StateBus) -> None:
         capture=capture,
         playback=playback,
         rtc_session_factory=MacosRtcSession,  # D2 swaps in WindowsRtcSession
+        recorder=recorder,
+        max_recordings=max_recordings,
     )
 
     activation_controller = ActivationController(
@@ -360,8 +363,8 @@ def run() -> None:
 
     # qasync + PySide6 imports are kept inside ``run`` so this module
     # imports cleanly on Linux / macOS for unit testing.
-    from PySide6 import QtWidgets  # noqa: PLC0415
     import qasync  # noqa: PLC0415
+    from PySide6 import QtWidgets  # noqa: PLC0415
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     # Tray app: closing the activation dialog must NOT exit the app.

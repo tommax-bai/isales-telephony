@@ -55,6 +55,7 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 
 from isales_telephony.audio_bridge import get_default_rtc_session_class
 from isales_telephony.edge.orchestrator import EdgeOrchestrator
@@ -63,6 +64,7 @@ from isales_telephony.modem_controller.audio_pipe import (
     PlaybackBackend,
 )
 from isales_telephony.modem_controller.main import _make_at_client
+from isales_telephony.modem_controller.recorder import Recorder
 from isales_telephony.transport.grpc_client import CloudEdgeGrpcClient
 from isales_telephony.transport.sqlite_buffer import SqliteEventBuffer
 
@@ -123,6 +125,26 @@ def _build_audio_backends() -> tuple[CaptureBackend, PlaybackBackend]:
             WindowsSerialPcmPlayback(audio_path),
         )
     raise RuntimeError(f"unknown ISALES_EDGE_AUDIO_BACKEND={backend!r}")
+
+
+def _build_recorder() -> tuple[Recorder | None, int]:
+    """Resolve the edge-local call recorder from env (edge-local-call-recording).
+
+    - ``ISALES_EDGE_RECORDINGS_DIR`` unset → recording disabled (returns
+      ``(None, 0)``). The product feature is opt-in per deploy.
+    - ``ISALES_EDGE_MAX_RECORDINGS`` (default 10) → rolling retention by file
+      count; ``0`` also disables recording.
+    - ``ISALES_EDGE_RECORDING_MIN_FREE_GB`` (default 1) → disk floor; a call
+      that starts with less free space is skipped (warning), call continues.
+
+    Recordings stay edge-local — no OSS upload, no DB write-back (v1.x).
+    """
+    rec_dir = os.environ.get("ISALES_EDGE_RECORDINGS_DIR")
+    max_recordings = int(os.environ.get("ISALES_EDGE_MAX_RECORDINGS", "10"))
+    if not rec_dir or max_recordings <= 0:
+        return None, 0
+    min_free_gb = int(os.environ.get("ISALES_EDGE_RECORDING_MIN_FREE_GB", "1"))
+    return Recorder(Path(rec_dir), min_free_gb=min_free_gb), max_recordings
 
 
 def _build_event_buffer() -> SqliteEventBuffer | None:
@@ -192,6 +214,7 @@ async def _arun_real(args: argparse.Namespace) -> None:
     at_client = await _make_at_client()
     capture, playback = _build_audio_backends()
     event_buffer = _build_event_buffer()
+    recorder, max_recordings = _build_recorder()
 
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     orchestrator = EdgeOrchestrator(
@@ -200,6 +223,8 @@ async def _arun_real(args: argparse.Namespace) -> None:
         capture=capture,
         playback=playback,
         rtc_session_factory=get_default_rtc_session_class(),
+        recorder=recorder,
+        max_recordings=max_recordings,
     )
 
     stop_event = asyncio.Event()

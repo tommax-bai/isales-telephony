@@ -1,9 +1,10 @@
-"""Recorder tests: stereo wav layout + Redis enqueue contract."""
+"""Recorder tests: stereo wav layout + rolling prune + Redis enqueue contract."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import wave
 from pathlib import Path
 
@@ -15,6 +16,19 @@ from isales_telephony.modem_controller.recorder import (
     RedisRecordingQueue,
     file_sha256,
 )
+
+
+def _record_one(rec: Recorder, call_id: str, mtime: float) -> Path:
+    """begin → append → finalize one call, then stamp a deterministic mtime
+    so prune's newest-first ordering is testable regardless of FS mtime
+    granularity."""
+    rec.begin_call(call_id)
+    rec.append_user(call_id, b"\x10\x00" * 800)
+    rec.append_ai(call_id, b"\x00\x10" * 800)
+    path = rec.finalize(call_id)
+    assert path is not None
+    os.utime(path, (mtime, mtime))
+    return path
 
 
 def test_finalize_writes_stereo_16k_wav(tmp_path: Path) -> None:
@@ -47,6 +61,49 @@ def test_finalize_pads_shorter_track_with_silence(tmp_path: Path) -> None:
 def test_finalize_unknown_call_returns_none(tmp_path: Path) -> None:
     rec = Recorder(tmp_path)
     assert rec.finalize("never-began") is None
+
+
+def test_prune_keeps_only_newest_n(tmp_path: Path) -> None:
+    rec = Recorder(tmp_path)
+    # 12 calls, mtimes 100..111 (call-11 newest).
+    for i in range(12):
+        _record_one(rec, f"call-{i}", mtime=100.0 + i)
+        rec.prune(keep=10)
+    remaining = sorted(p.stem for p in tmp_path.glob("*.wav"))
+    # The two oldest (call-0, call-1) were pruned; newest 10 survive.
+    assert "call-0" not in remaining
+    assert "call-1" not in remaining
+    assert len(remaining) == 10
+    assert "call-11" in remaining and "call-2" in remaining
+
+
+def test_prune_deletes_strictly_oldest_by_mtime(tmp_path: Path) -> None:
+    rec = Recorder(tmp_path)
+    # Write out of call-id order but with explicit mtimes so the oldest
+    # by mtime (not by name) is the one pruned.
+    _record_one(rec, "zzz", mtime=100.0)  # oldest
+    _record_one(rec, "aaa", mtime=200.0)
+    _record_one(rec, "mmm", mtime=300.0)
+    rec.prune(keep=2)
+    remaining = {p.stem for p in tmp_path.glob("*.wav")}
+    assert remaining == {"aaa", "mmm"}  # "zzz" pruned despite alphabetical first
+
+
+def test_prune_noop_when_under_limit(tmp_path: Path) -> None:
+    rec = Recorder(tmp_path)
+    _record_one(rec, "call-a", mtime=100.0)
+    _record_one(rec, "call-b", mtime=101.0)
+    rec.prune(keep=10)
+    assert len({p for p in tmp_path.glob("*.wav")}) == 2
+
+
+def test_prune_keep_zero_is_noop_does_not_wipe(tmp_path: Path) -> None:
+    # keep<=0 must NOT delete everything — disabling recording is the
+    # caller's job (skip begin_call), not prune's.
+    rec = Recorder(tmp_path)
+    _record_one(rec, "call-a", mtime=100.0)
+    rec.prune(keep=0)
+    assert len(list(tmp_path.glob("*.wav"))) == 1
 
 
 def test_begin_call_raises_when_disk_low(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
