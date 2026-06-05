@@ -287,6 +287,11 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
     _rtc_production = getattr(_rtc_cls, "production", None)
     rtc_session_factory = _rtc_production if _rtc_production is not None else _rtc_cls
 
+    # edge-local-call-recording: same env-gated recorder as the modem path
+    # (§ _build_recorder). dev-no-modem taps user mic + AI playback into it
+    # (orchestrator._dev_no_modem_*); unset ISALES_EDGE_RECORDINGS_DIR → off.
+    recorder, max_recordings = _build_recorder()
+
     orchestrator = EdgeOrchestrator(
         grpc_client=grpc_client,
         rtc_session_factory=rtc_session_factory,
@@ -294,6 +299,8 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
         dev_channel=args.dev_channel,
         dev_uid=args.dev_uid,
         dev_peer_uid=args.dev_peer_uid,
+        recorder=recorder,
+        max_recordings=max_recordings,
     )
 
     stop_event = asyncio.Event()

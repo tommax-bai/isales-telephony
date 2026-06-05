@@ -460,14 +460,31 @@ $SSH 'journalctl -u isales-engine --since "2 min ago" --no-pager \
 | `hangup_cause=` | `user_hangup` / `goal_reached` | `silence_max_reached` = you went quiet and the `campaign.silence_threshold_ms` (currently 12000) timer expired. Fine if you meant to stop; not a failure of the pipeline. |
 | smoke JSON `"ok"` | — | **Known script bug**: success check compares `status in {"ended"}` but the real terminal status is `"end"`, so `ok:false` even on a perfect run. Judge by `status:"end"` + a non-empty `transcript_len`, not by `ok`. |
 
-### 7.5 Is there a recording?
+### 7.5 Recording the call (both channels)
 
-No production recording in dev — `call_record.recording_url` is NULL
-(the OSS upload pipeline is a future change, not wired here). The only
-audio artifact is a **DIAG dump of the first 15 s of inbound audio**
-(your mic only — the AI downlink is what the engine *sends*, so it is
-not in this file), written unconditionally and **overwritten every
-call**. It lives in the engine's systemd PrivateTmp namespace:
+The edge-local recorder now works on the **dev-no-modem path** too (see
+OpenSpec change `edge-recording-dev-no-modem`). Set the recording dir
+**before launching** — the smoke spawns the edge with `{**os.environ,…}`,
+so an exported var reaches the daemon:
+
+```bash
+export ISALES_EDGE_RECORDINGS_DIR="$HOME/isales-recordings"   # unset → recording off
+export ISALES_EDGE_MAX_RECORDINGS=10                          # rolling; 0 also disables
+# then run § 7.2 as usual. On hangup the edge writes:
+#   $ISALES_EDGE_RECORDINGS_DIR/<call_id>.wav   (stereo 16 kHz)
+#   L = your mic (upstream)   R = AI TTS (downstream, downmixed 48k→16k)
+# look for `recording_finalized call_id=… path=…` in the edge log.
+afplay "$HOME/isales-recordings/<call_id>.wav"
+```
+
+This is the real "full call with the AI's voice" recording. It stays
+**edge-local** — no OSS upload, and `call_record.recording_url` stays
+NULL in v1.0 (the OSS write-back is a deferred v1.x path).
+
+Separately, the engine keeps a **DIAG dump of the first 15 s of inbound
+audio** (your mic only), written unconditionally and overwritten every
+call, in its systemd PrivateTmp namespace — handy when the edge recorder
+is off:
 
 ```bash
 $SSH 'find /tmp/systemd-private-*isales-engine*/tmp -name inbound_raw_48k_stereo.pcm'
@@ -480,7 +497,7 @@ w.setframerate(48000);w.writeframes(r);w.close()"
 afplay /tmp/call_inbound_15s.wav
 ```
 
-This dump is gated by the `DIAG-REMOVE-AFTER-MIC-DEBUG` markers in
+That dump is gated by the `DIAG-REMOVE-AFTER-MIC-DEBUG` markers in
 `rtc_telephony.py` and goes away when those are removed (trigger:
 `joint-mvp-gate-13301035545` Windows real-dial acceptance passes).
 
