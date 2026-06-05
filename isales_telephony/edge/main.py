@@ -311,7 +311,11 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
 
 
 async def _arun(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=os.environ.get("ISALES_LOG_LEVEL", "INFO"))
+    logging.basicConfig(
+        level=os.environ.get("ISALES_LOG_LEVEL", "INFO"),
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     if args.dev_no_modem:
         await _arun_dev_no_modem(args)
     else:
