@@ -199,16 +199,25 @@ real call leg lives between cloud engine and your phone via the
 external SIP path). Wear headphones to avoid the mac mic capturing
 the speaker TTS.
 
-Interrupt the AI mid-sentence by speaking. Watch the engine log for:
+Interrupt the AI mid-sentence by speaking. **Barge-in log markers
+(current, 2026-06-05)** — VAD-driven cancel is **disabled** (it
+false-triggered on ambient noise, 2026-06-03); barge-in now runs off
+ASR partial text length via `evaluate_partial`. Watch the engine log
+for:
 
 ```
-barge_in_detected vad_active_ms=... policy=immediate_cancel
-tts_cancel call_id=...
+# (NOT the old `barge_in_detected` / `tts_cancel` strings — those are gone)
+isales_engine.run_loop vad_monitor_cancel_disabled_prototype ...   # VAD path is off
+isales_engine.realtime.interruption_detector evaluate_partial ... triggered=true
+isales_engine ... CallStatus.INTERRUPTED reason="speaking_interrupted"
 ```
 
-The VAD active duration before cancel + the round-trip from
-detection to playback stop are the policy knobs that dev work tunes
-in this form factor.
+Barge-in only fires when you talk **over** the AI mid-sentence (the
+listen pumps start *after* the greeting, so the greeting itself
+cannot be barged in on — see `run_loop.py` greeting note). Clean
+turn-taking (waiting for the AI to finish) will **never** produce an
+`INTERRUPTED` marker. See § 7 for the repeatable test + how to read
+the result.
 
 **3.4 Hang up.**
 SIGINT the edge daemon (`Ctrl-C`). The dev path emits
@@ -336,3 +345,149 @@ directly.
 You ran the dev path on Linux or Windows. Windows commercial work
 uses `deploy/edge/windows/build.ps1` to build the pybind11 binding;
 Linux is not a supported edge platform in v1.0.
+
+---
+
+## 7. Repeatable e2e smoke test (start here — automated fast path)
+
+§ 2–3 above are the *manual* launch. For a routine "does the whole AI
+dialogue still work end-to-end" check, use the self-driving smoke
+script `scripts/mac_dev_no_modem_smoke.py`. It spawns the edge, mints
+its own JWT, injects a dial via Redis, polls `call_record`, and tears
+the edge down. You only have to **wear headphones and talk**. This
+section is the full checklist so a fresh session doesn't re-derive it.
+
+> SSH note: a normal human shell uses
+> `ssh -i ~/codes/isales-4.pem root@121.89.85.150 '<cmd>'`.
+> A Claude Code session runs as root uid and must add
+> `-o UserKnownHostsFile=/Users/bears/.ssh/known_hosts -o IdentitiesOnly=yes`
+> (else `Host key verification failed`). The smoke *script* already
+> passes `StrictHostKeyChecking=no`, so it works either way.
+
+### 7.1 Pre-flight (~1 min — skipping this is what burns an afternoon)
+
+```bash
+# (a) NO leftover edge process. Stale ones hold the CoreAudio device →
+#     next edge hangs at startup with "ready timeout", 0 log lines.
+pgrep -fl isales-telephony-edge        # MUST print nothing
+#     if any: kill them, and if a later edge still hangs:
+#     sudo killall coreaudiod   (or log out / run in your own clean Terminal)
+
+# (b) JWT not expired (TTL 24h). Decode exp:
+python3 - <<'PY'
+import base64,json,time
+t=open('/Users/bears/.isales/edge-dev.jwt').read().strip();p=t.split('.')[1];p+='='*(-len(p)%4)
+d=json.loads(base64.urlsafe_b64decode(p));print('remaining_h',round((d['exp']-time.time())/3600,1))
+PY
+#     if ≤0 → re-mint (sources api.env on ECS for ISALES_JWT_SECRET):
+ssh -i ~/codes/isales-4.pem root@121.89.85.150 \
+  'set -a; . /etc/isales/env/api.env; set +a; \
+   /opt/isales/current/venv/bin/isales-edge-token-mint --device-id edge-mac-dev-01 --ttl 24h 2>&1 | tail -1' \
+  > ~/.isales/edge-dev.jwt && chmod 600 ~/.isales/edge-dev.jwt
+#     NB: the smoke script mints its OWN token for device-id `edge-01`
+#     (matches engine.env ISALES_ENGINE_EDGE_DEVICE_ID) — the file above
+#     is only needed for the *manual* § 2 launch.
+
+# (c) ECS engine is up AND running the code you think it is. ECS git
+#     HEAD is unreliable (deploys are scp-overwrite, working tree is
+#     permanently dirty — see meta-repo feedback_ecs_deploy_scp). Trust
+#     md5, not `git log`:
+ssh -i ~/codes/isales-4.pem root@121.89.85.150 \
+  'systemctl is-active isales-engine; \
+   md5sum /opt/isales/current/isales-engine/isales_engine/run_loop.py \
+          /opt/isales/current/isales-engine/isales_engine/providers/asr_volcengine.py'
+md5 -q ~/codes/isales-engine/isales_engine/run_loop.py \
+       ~/codes/isales-engine/isales_engine/providers/asr_volcengine.py
+#     The two md5 sets MUST match (else scp the mac branch up + restart;
+#     see meta-repo feedback_ecs_deploy_scp for the scp-overwrite flow).
+
+# (d) Vendor SDK + pyobjc present on mac:
+~/codes/isales-telephony/.venv/bin/python -c "import objc; print('pyobjc', objc.__version__)"
+ls -d ~/codes/vendor/DingRTC_macOS_SDK_3_9_0/DingRTC.framework
+```
+
+### 7.2 Launch (background, non-interactive)
+
+The interactive listen-check prompt can't take y/n through a non-tty,
+so run with `--no-listen-check` and judge the result from the engine
+log instead.
+
+```bash
+cd ~/codes/isales-telephony
+rm -f /tmp/mac-smoke.log
+nohup .venv/bin/python scripts/mac_dev_no_modem_smoke.py \
+      --no-listen-check --timeout 120 > /tmp/mac-smoke.log 2>&1 &
+# tail /tmp/mac-smoke.log; the call is LIVE once you see
+#   "[4/6] inject DialRequest ... ✓ injected ... lead=2"
+# → the AI greeting plays on the mac speaker within ~2 s. PUT HEADPHONES ON.
+```
+
+Other flags: `--phase1-only` (cloud sanity only, no edge/no call),
+`--dry-run`, `--skip-edge-start` (edge already running externally),
+`--timeout N` (poll longer).
+
+### 7.3 Live monitoring (from a second shell, while the call runs)
+
+Note the call's `sid` / `call_record id` from `/tmp/mac-smoke.log`
+(`call_record id=NNN`), then watch the engine journal. Useful greps —
+drop the per-second noise:
+
+```bash
+SSH="ssh -i ~/codes/isales-4.pem root@121.89.85.150"   # add the root-uid opts in a Claude session
+
+# your speech recognised (the #1 thing that fails — see 7.4):
+$SSH 'journalctl -u isales-engine --since "2 min ago" --no-pager | grep "volcengine_asr_FINAL"'
+
+# barge-in fired? (only if you talked OVER the AI):
+$SSH 'journalctl -u isales-engine --since "2 min ago" --no-pager \
+      | grep -iE "INTERRUPTED|speaking_interrupted|evaluate_partial.*trigger"'
+
+# inbound signal level (raw_max_rms / post_downmix_rms) + downmix sanity:
+$SSH 'journalctl -u isales-engine --since "2 min ago" --no-pager | grep "rtc_inbound_1s" | tail'
+
+# how the call ended:
+$SSH 'journalctl -u isales-engine --since "2 min ago" --no-pager \
+      | grep -iE "session_finalized|hangup_cause|state_transition_unusual"'
+```
+
+### 7.4 Reading the result — green vs the known traps
+
+| Signal | Green | Trap / meaning |
+|---|---|---|
+| `volcengine_asr_FINAL text='…'` | one per thing you said, real Chinese | **empty / none** → your voice too quiet. Check `post_downmix_rms`: need **>2000-ish**; ~600 = vendor recognises nothing (06-04 call 139). Speak up + headphones on. |
+| `rtc_inbound_1s ... channels=2 ... after_resample_bytes=320` | always 2-ch in, 320 B out (16k mono 20ms) | the stereo→mono downmix fix; if `after_resample_bytes` looks like 2× this, the downmix regressed. |
+| barge-in `INTERRUPTED` | present **iff** you deliberately talked over the AI | absent on clean turn-taking is **expected, not a bug** — barge-in can only fire mid-AI-speech. To test it you must cut the AI off mid-sentence. |
+| `hangup_cause=` | `user_hangup` / `goal_reached` | `silence_max_reached` = you went quiet and the `campaign.silence_threshold_ms` (currently 12000) timer expired. Fine if you meant to stop; not a failure of the pipeline. |
+| smoke JSON `"ok"` | — | **Known script bug**: success check compares `status in {"ended"}` but the real terminal status is `"end"`, so `ok:false` even on a perfect run. Judge by `status:"end"` + a non-empty `transcript_len`, not by `ok`. |
+
+### 7.5 Is there a recording?
+
+No production recording in dev — `call_record.recording_url` is NULL
+(the OSS upload pipeline is a future change, not wired here). The only
+audio artifact is a **DIAG dump of the first 15 s of inbound audio**
+(your mic only — the AI downlink is what the engine *sends*, so it is
+not in this file), written unconditionally and **overwritten every
+call**. It lives in the engine's systemd PrivateTmp namespace:
+
+```bash
+$SSH 'find /tmp/systemd-private-*isales-engine*/tmp -name inbound_raw_48k_stereo.pcm'
+# pull it down + wrap to a playable WAV (48k stereo s16le, no re-encode):
+scp -i ~/codes/isales-4.pem \
+  "root@121.89.85.150:$(…the path above…)" /tmp/call_inbound_15s.pcm
+python3 -c "import wave;r=open('/tmp/call_inbound_15s.pcm','rb').read();\
+w=wave.open('/tmp/call_inbound_15s.wav','wb');w.setnchannels(2);w.setsampwidth(2);\
+w.setframerate(48000);w.writeframes(r);w.close()"
+afplay /tmp/call_inbound_15s.wav
+```
+
+This dump is gated by the `DIAG-REMOVE-AFTER-MIC-DEBUG` markers in
+`rtc_telephony.py` and goes away when those are removed (trigger:
+`joint-mvp-gate-13301035545` Windows real-dial acceptance passes).
+
+### 7.6 Cleanup
+
+The smoke script terminates its own edge daemon on exit. If you
+launched the edge manually (§ 2), `Ctrl-C` it (emits
+`remote_hangup{dev_terminate}` → not rescheduled). Always re-run 7.1(a)
+before the next test — a leftover edge is the single most common reason
+the next run hangs.
