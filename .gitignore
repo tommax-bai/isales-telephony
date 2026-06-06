@@ -34,3 +34,7 @@ deploy/edge/windows/vendor/aliyun-artc-windows/x86/
 *.jwt
 .edge-token-*
 scripts/_pybind_join_probe.py
+
+# Edge daemon full-stack dial-test logs (transient; STATE.md § 操作手册)
+edge_daemon_test.log
+*.daemon.log

@@ -1,30 +1,77 @@
 # Windows edge dev rig — current state snapshot
 
-> **2026-05-31(晚)— modem 上下行【两个方向都实测可用】;"电话到AI"真凶在
-> edge 上行链路,不在 modem / 不在驱动 / 不需要换 WinUSB。**
-> - ✅ 上行(AI→电话,主机写 COM11):对端真人听到 tone。
-> - ✅ 下行(电话→AI,主机读 COM11):读出干净 **8kHz** PCM,对端真人声 amp
->   2000–3500、静音 ~10(`capture_downlink.py` 实测)。
-> - ❌ **仍未解的真 bug**:全栈真拨,引擎**全程只收到静音 → 因静音挂断**
->   (call_record #96 transcript 实证:greeting 发出=下行通,之后全是
->   `silence_activation`→`silence_max_reached`)。即 **modem 读得到对端声音,
->   但送不进引擎**。
-> - **✅ 已锁定(call #98 fake-WAV 注入实测,见下方详节):** 用
->   `ISALES_FAKE_CAPTURE_WAV` 绕开 modem、把已知真人语音当上行喂进 daemon,
->   `upstream_push` 一路在推真语音、无 RtcError,**引擎照样只收到静音**。→ bug
->   **不在 modem、不在上行 pump**(上行 pump 工作,旧"pump 一抛错就死"假设证伪),
->   **在 `push_external_audio`→DingRTC 上行 publish→引擎接收**这一段(edge push
->   返回成功但音频没成为引擎可听的已发布流)。下一步在 engine/DingRTC publish 侧查。
-> - **次要 bug:** 引擎挂断后 edge 没收到挂断、继续空推 + modem 通话不挂(烧钱)。
-> - **已被本轮证伪的旧结论(别再信):**(a)"写共享句柄→下行读塌到 640 B/s 的
->   全双工硬墙"——`diag_duplex_collapse.py` 干净复测下行没塌;(b)"downlink
->   ≈32KB/s 偏 16kHz"——实测 8kHz;(c)"出路 A 换 WinUSB/Zadig、出路 B 改
->   Linux"——前提已塌,**Zadig 永久作废**(客户 PC 不可能换驱动)。
-> - 详见下方 § "上行硬墙证伪 + 端点确证 + 下行真凶定位 (2026-05-31 晚)"。
+> **🎉 2026-06-06 — 全栈真拨 13301035545【完全打通】,"电话→AI" bug 已解决,
+> 13301035545 联合 MVP gate PASS。** 一通 ~114s 完整双向 AI 对话(call_record
+> **#157**),真人每句话(Python / 大模型开发 / 转行 / 留手机号)都被正确 ASR 进引擎,
+> multi-referee 引擎(`selected_role_config_id=4`/`main_judge`)逐轮贴题回复,用户主动挂断。
+> - **真凶订正(推翻 5-31 的 publish 结论):** 不在 edge `push_external_audio`/
+>   DingRTC publish,而在**引擎接收侧** —— edge 上行是 48k **立体声**,引擎旧代码当
+>   16k 单声道解释成垃圾 → VAD 判静音。修复 = `isales-engine`
+>   `realtime/rtc_telephony.py` `audioop.tomono` 48k stereo→16k mono(commit
+>   `e7b1c66`,merge `dd739c4`,6-01 上线 ECS;6-05 multi-referee 重构一并部署)。
+>   ⇒ 5-31 fake-WAV"锁定在 edge publish→引擎"的结论**已被证伪**:edge publish 一直
+>   是好的,问题在引擎解码前的声道归一化。
+> - ✅ modem 上下行两方向仍实测可用(本通 `VOICE CALL: BEGIN`→107s→`NO CARRIER`→
+>   `AT+CPCMREG=0` 干净拆线,**没卡 off-hook、没烧钱**)。
+> - ⚠️ **残留次要 gap(非阻塞):** 通话结束后 **device 卡 `dialing` 不自动复位**
+>   (lead 已由 worker 推进到 `follow_up_exhausted`,引擎/worker 侧都收到了挂断;
+>   缺的是 device 状态回 idle)。重测前必须 SQL 复位 device →idle(见 § 操作手册)。
+>   本通 modem 烧钱 bug **未复现**(NO CARRIER 正常收尾)。
+> - **早已证伪、别再信:**(a)"写共享句柄→下行读塌到 640 B/s 全双工硬墙";
+>   (b)"downlink ≈32KB/s 偏 16kHz"——实测 8kHz;(c)"换 WinUSB/Zadig 或改
+>   Linux"——**Zadig 永久作废**(客户 PC 不可能换驱动)。
 > - COM 号每次重插重排(认 description,`discover_modem_serial_paths()`);
->   当前 AT=COM12 / AUDIO=COM11 / DIAG=COM10。
+>   2026-06-06 实测 AT=COM12 / AUDIO=COM11 / DIAG=COM10。
+> - 详见下方 § "🎉 全栈真拨 PASS (2026-06-06)"。以下 5-31 的诊断历史段落保留作脉络,
+>   其"引擎只收静音 / bug 在 publish"的中间结论均以本 banner 为准订正。
+
+## 🎉 全栈真拨 PASS (2026-06-06) — "电话→AI" 打通 + 根因订正
+
+**测试:** 复位 `device 3→idle` + `lead 2→new` 后,campaign 1(早已 running)的
+scheduler **自动派发** → daemon 真拨 13301035545 → 用户接听并持续对话 ~114s →
+用户主动挂断。daemon 用 `_run_daemon_dev.py`(`.venv-3.12`),4 个 READY 全绿
+(`modem_registered` / `audio_port_opened (shared handle) audio=COM11` /
+`dingrtc_loaded` / `grpc_connected`)。
+
+**结果 = 完整双向 AI 对话(call_record #157):** greeting → 真人"喂你好" →
+8 轮一问一答,真人每句(`Python` / `大模型开发的工` / `转行` / `怎么领` /
+`手机号就行` / `谢谢` / `挂了吧`)都被 ASR 正确转写进引擎,引擎逐轮贴题回复
+(`selected_role_config_id=4`,`primary_referee_label=main_judge`,routing_rules 生效),
+末轮 `hangup reason=user_hangup`。即 **modem 采到的对端真人声成功送进引擎并被听懂**。
+
+**根因订正(关键 —— 推翻 5-31 fake-WAV 的"锁定在 edge publish"结论):**
+- 5-31 call #96/#97/#98 引擎全程静音,当时(用 fake-WAV 绕开 modem 仍静音)推断 bug 在
+  `WindowsDingRtcSession.push_external_audio` → DingRTC 上行 publish → 引擎接收。
+- **实际真凶在引擎接收侧的声道归一化:** edge 上行经 DingRTC 是 **48kHz 立体声**,
+  引擎旧代码未下混就喂 ASR → 把 stereo 字节当 mono 16k 解释成噪音/近静音 → VAD 判静音。
+- 修复:`isales-engine` `isales_engine/realtime/rtc_telephony.py` 加
+  `audioop.tomono(pcm, 2, 0.5, 0.5)` 把 48k stereo 先下混再 ratecv 到 16k mono
+  (commit `e7b1c66` "fix(rtc): downmix 48k stereo → 16k mono before ASR push",
+  merge `dd739c4` `fix/inbound-stereo-downmix-20260601`,2026-06-01;随
+  `engine-multi-referee-and-restructure` 于 2026-06-05 部署 ECS,
+  `/opt/isales/current/isales-engine/.../rtc_telephony.py:284` 已确证带 `tomono`)。
+- ⇒ **edge publish 一直是好的**;5-31 fake-WAV 之所以也静音,是同一个引擎下混 bug,
+  与 edge 无关。"bug 在 edge publish→引擎"这条**作废**。
+
+**modem 收尾(本通实测,部分推翻 5-31 烧钱担忧):** `VOICE CALL: BEGIN`(10:09:48)→
+107s 通话 → 用户挂断 `VOICE CALL: END` + `NO CARRIER`(10:11:35)→ daemon 立即
+`AT+CPCMREG=0`,**modem 干净拆线、没卡 off-hook、没空推烧钱**。日志尾部
+`Uploader::OnError => 3 Access denied by authorizer's policy` + `CompressImpl ...
+dingrtc/log/` 是 **DingRTC SDK 自传诊断日志到 OSS 被拒**的噪音,**非音频通路**。
+
+**残留次要 gap(非阻塞,留作后续 OpenSpec change):** 通话结束后 **device 状态卡
+`dialing` 不自动复位**(心跳照常 fresh,但状态不回 idle)→ 阻塞下一次派发,重测前
+必须 SQL `UPDATE device SET status='idle'`。对比:lead 已由 worker 正确推进到
+`follow_up_exhausted`(post-call 处理跑了),引擎也记了 user_hangup —— 即挂断在
+engine/worker 侧都到位,**唯独 device 状态回写缺失**。这是 5-31 记的"挂断不从
+engine 传播到 edge"次要 bug 的**剩余子集**(空推+modem 不挂这次没复现)。
 
 ## ⏭️ 会话交接 — 2026-05-31 收尾,明天续（可能换电脑,故记于此而非本机 memory）
+
+> **⚠️ 2026-06-06 订正:本节(及下方"结论(已坐实…)"段)断言的"bug 锁定在
+> `push_external_audio`→DingRTC publish→引擎接收"已被 2026-06-06 真拨 PASS 证伪。**
+> 真凶在引擎接收侧 48k stereo→mono 下混(已修,见顶部 banner + § "🎉 全栈真拨 PASS")。
+> edge publish 一直正常。本节以下内容保留作调试脉络,结论以顶部 banner 为准。
 
 > **🚧 Fresh session 反误读警示(2026-06-01 教训补刻):** 如果你想答
 > "昨天 Windows DingRTC 卡在哪",**先读完本节、再去看 meta-repo**。
@@ -618,13 +665,20 @@ Token (`device_id=edge-01`, 365d TTL, minted on ECS 2026-05-17) sits at
 
 ## What's NOT yet done (dev rig perspective)
 
+> **🎉 2026-06-06: `D1 §9.3 真拨号 13301035545` 与 `edge full daemon launch`
+> 两行均已 PASS** —— 真拨完整双向 AI 对话(call_record #157),见顶部 banner +
+> § "🎉 全栈真拨 PASS (2026-06-06)"。下表 §9.4/§9.5/PyInstaller 仍为 ARTC 时代
+> 旧条目,DingRTC 迁移后 §7.x 已覆盖其大部(见 § pybind);唯 PyInstaller
+> frozen-exe 在干净 PC 上的 unwrap 测试仍未做。device 通话后卡 `dialing` 不复位
+> 是剩余次要 gap(非阻塞)。
+
 | Gate | Blocking on | Owner |
 |---|---|---|
-| **isales-telephony-edge full daemon launch** | Edge entry-point not yet exercised in any session — needs full wiring of: COM12 AT + COM11 SerialPcm audio + ARTC pybind .pyd in dev import path + cloud-edge gRPC client + `.edge-token-test.jwt` env injection | Claude (no extra user input needed) |
+| ~~**isales-telephony-edge full daemon launch**~~ ✅ **DONE 2026-06-06** | 真拨 #157 全链路绿(4 READY + 双向音频 + 8 轮对话) | — |
 | **pybind §9.4 real ARTC RTC join smoke** | Needs RTC client join token (signed with `ISALES_RTC_APP_KEY` from ECS engine.env) — either scp the AppKey down, or sign the token on ECS and scp it down | Easy: scp + write a small `scripts/pybind_rtc_join_smoke.py` |
 | **pybind §9.5 real PCM push/pull P95** | Needs §9.4 first + engine side joining same channel + clock-aligned latency measure | Medium: requires ECS engine to be put into a "listen on test channel" mode, or write a separate Linux-side listener using the ARTC Linux Python wrapper |
 | **PyInstaller frozen-exe smoke (§9.3)** | Needs `build.ps1` full run end-to-end (will succeed now that toolchain is in place) + a clean Win PC for the final unwrap-and-launch test | User: need clean PC, OR I can produce the zip and we test on dev box for partial coverage |
-| **D1 §9.3 真拨号 13301035545** | All of the above + AI provider stack ready (engine side) + PG seed data (campaign + lead) + edge daemon dialing through cloud-edge gRPC | Joint MVP gate; multiple pieces. **音频上行已 unblock**(2026-05-31 对端听到 tone,见 § "SIM7600 USB audio uplink — 实测可用");剩 OUT-卡死软复位 + `windows_serial_pcm.py` 硬化 |
+| ~~**D1 §9.3 真拨号 13301035545**~~ ✅ **PASS 2026-06-06** | — | **联合 MVP gate 通过**:call_record #157 完整双向 AI 对话,真人语音被 ASR 进引擎、multi-referee 逐轮贴题回复、user_hangup 收尾。根因(引擎 48k stereo→mono 下混)已修+部署。剩余非阻塞:device 通话后卡 dialing 不复位(→ 后续 OpenSpec change) |
 
 ## Bootstrap a new dev session — verify before asserting state
 
