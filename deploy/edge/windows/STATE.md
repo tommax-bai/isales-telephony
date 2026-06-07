@@ -1,5 +1,28 @@
 # Windows edge dev rig — current state snapshot
 
+> **🔧 2026-06-07 深夜 §9 重跑 (#165/#166) — modem 采集会进"坏态"，USB 物理重插复位 (实证)；
+> + 延迟数据 + bug2 远端挂断精确定位。**
+> - **现象**：fresh daemon 第一通 (#165) 引擎上行 `raw_max_rms=0` **整整 40 秒**（你听到开场白、
+>   接通就说话，引擎却收到纯静音）→ silence_max_reached 挂断。
+> - **隔离实证 (决定性)**：`capture_downlink.py` 绕开 daemon + 云端，**纯读 COM11**。头两次没接通
+>   （工具 pyserial readline 可能漏 URC，或没接上）；**用户物理重插 USB 后第 3 次 PASS** — 逐秒
+>   `amp 4000-5000 @ 8kHz`（240000B/15s=15990 B/s）→ **modem 采集通路本身完全正常**。
+> - **结论**：真因 = **modem 进了采集坏态，物理重插复位**（`AT+CRESET` 软复位能否替代**待验**）。
+>   ⚠️ **refine 早先 handoff 的 "bug1 边缘上行泵每 daemon 只活第一通"**：上行泵**没停**
+>   （#165 `upstream_push` 推满 1.0MB、`duplex_pump` n=1600、in=320/out=640 全程在跑），是
+>   **modem capture 喂了静音**。`run_duplex_pump` 本就是 **lockstep 单任务**（读一帧→写一帧、不并发），
+>   所以 **"共享句柄写饿死读" 的说法证伪，别再追那条**。
+> - **#166（重插后，PASS）**：完整双向对话 — ASR 正确转写 `哎，方便`/`uh，Python 开发`/
+>   `呃，我想用 Python`，AI 逐轮贴题回复。**延迟健康 ~1.0-1.5s**（你说完→AI 出声）：拆解 =
+>   ASR-EOS ~0.4-0.6s (`end_window_ms=400`) + main LLM 首 token ~0.3-0.6s + TTS 首字节 0.25-0.38s，
+>   **无单一瓶颈**。⚠️ gate-first **裁判放音延迟没测到**（`pipeline_trace` 空，见 bug2；需 `first_audio_ms`）。
+> - **🔴 bug2 远端挂断不 finalize（精确定位）**：#166 用户挂断 → edge `VOICE CALL: END`+`NO CARRIER`
+>   @22:37:47 → `audio_bridge_left`（离开 RTC）+ `CPCMREG=0`（**边缘 + modem 干净收尾、没卡没烧钱**），
+>   **但日志无任何"发 gRPC 挂断事件给引擎"**；引擎也**不在 RTC 对端离开时 finalize** → `call_record` #166
+>   卡 `init`、`pipeline_trace` 0 行、session held open。对比 #165 引擎主动静音挂断 finalize 正常
+>   (`persisted=True`)。⇒ **修区 = 引擎 finalize-on-remote-hangup + edge 发显式 hangup CallEvent**；
+>   关联未跟踪 change `device-status-reset-on-call-end`（同片区）。详见 `[[project-session-20260607-handoff]]`。
+>
 > **🎉 2026-06-06 — 全栈真拨 13301035545【完全打通】,"电话→AI" bug 已解决,
 > 13301035545 联合 MVP gate PASS。** 一通 ~114s 完整双向 AI 对话(call_record
 > **#157**),真人每句话(Python / 大模型开发 / 转行 / 留手机号)都被正确 ASR 进引擎,
