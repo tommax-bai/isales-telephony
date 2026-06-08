@@ -65,6 +65,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+# 同目录的自动判读层 (verdict)。`python scripts/x.py` 时 scripts/ 已是 sys.path[0],
+# 显式插入更稳 (也支持别处调用 / python -m)。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mac_dev_auto_analyze import analyze, print_report, probe_engine_grpc  # noqa: E402
+
 # ---------- constants -------------------------------------------------------
 
 DEFAULT_SSH_HOST = "root@121.89.85.150"
@@ -434,6 +439,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="print intent + ssh test only")
     p.add_argument("--preflight-only", action="store_true",
                    help="只跑 phase 1 (cloud systemd + DingRTC + PG + provider_credential check) 立即退出; 用于 sanity check, 不 mint JWT 不 spawn edge")
+    p.add_argument("--skip-freeze-probe", action="store_true",
+                   help="跳过 engine grpc 冻死探测 (bug2: systemd active 但 event loop 冻死)")
+    p.add_argument("--analyze-since", default="15 min ago",
+                   help="自动判读时 journalctl --since 窗口 (默认 '15 min ago')")
     return p
 
 
@@ -455,6 +464,19 @@ def main() -> int:
         return 0
     jwt = phase_mint_jwt(args)
 
+    # [freeze probe] engine systemd active 不代表 event loop 没冻死 (bug2:
+    # 远端挂断把 engine asyncio loop 拖死, 新 gRPC 连接全 hang)。起 edge 前
+    # 用一次 grpc Bidi initial_metadata 探活, 避免对着冻死的 engine 白测。
+    if not args.skip_freeze_probe:
+        print("[2.5/6] engine freeze probe (grpc Bidi) ...", file=sys.stderr)
+        alive, msg = probe_engine_grpc(args.ecs_endpoint, jwt)
+        if not alive:
+            sys.exit(
+                f"  ✗ engine 冻死: {msg}\n"
+                f"    → 先 ssh {args.ssh_host} 'systemctl restart isales-engine'"
+            )
+        print(f"  ✓ {msg}", file=sys.stderr)
+
     edge_proc: subprocess.Popen[bytes] | None = None
     if args.skip_edge_start:
         print("[3/6] skipping edge daemon start (--skip-edge-start)", file=sys.stderr)
@@ -464,15 +486,28 @@ def main() -> int:
     try:
         phase_inject_dial(args)
         result = phase_poll_call_record(args)
-        listened = True
+
+        # [自动判读] 两端日志 → 9 检查点 PASS/WARN/FAIL (取代人工 grep)
+        print("\n[判读] 自动分析 engine+edge 日志 ...", file=sys.stderr)
+        report = analyze(
+            result["call_id"], args.analyze_since,
+            ssh_host=args.ssh_host, ssh_key=args.ssh_key, edge_log=EDGE_LOG_PATH,
+        )
+        print_report(report)
+
+        # listen-check 降级为可选辅助 (analyzer 是主判读); 默认仍问, --no-listen-check 跳过
+        listened: bool | None = None
         if not args.no_listen_check:
             listened = phase_listen_check(result)
 
-        # final summary
+        # final summary — ok 以 analyzer overall 为准 (不再只看 status==ended)
         summary = {
-            "ok": result["status"] in {"ended"} and listened,
+            "ok": report["overall"] != "FAIL" and (listened is not False),
+            "overall": report["overall"],
             "call_id": result["call_id"],
             "status": result["status"],
+            "first_asr_text": report["first_asr_text"],
+            "hangup_cause": report["final_hangup_cause"],
             "transcript_len": len(result["transcript"]) if isinstance(result["transcript"], list) else None,
             "listened": listened,
             "edge_log": str(EDGE_LOG_PATH),
