@@ -7,7 +7,7 @@
 > - **隔离实证 (决定性)**：`capture_downlink.py` 绕开 daemon + 云端，**纯读 COM11**。头两次没接通
 >   （工具 pyserial readline 可能漏 URC，或没接上）；**用户物理重插 USB 后第 3 次 PASS** — 逐秒
 >   `amp 4000-5000 @ 8kHz`（240000B/15s=15990 B/s）→ **modem 采集通路本身完全正常**。
-> - **结论**：真因 = **modem 进了采集坏态，物理重插复位**（`AT+CRESET` 软复位能否替代**待验**）。
+> - **结论**：真因 = **modem 进了采集坏态，物理重插复位**（`AT+CRESET` 软复位能否替代**待验** → 验证工具见本块末 🪜 与 `scripts/modem_capture_recover.py`）。
 >   ⚠️ **refine 早先 handoff 的 "bug1 边缘上行泵每 daemon 只活第一通"**：上行泵**没停**
 >   （#165 `upstream_push` 推满 1.0MB、`duplex_pump` n=1600、in=320/out=640 全程在跑），是
 >   **modem capture 喂了静音**。`run_duplex_pump` 本就是 **lockstep 单任务**（读一帧→写一帧、不并发），
@@ -22,6 +22,17 @@
 >   卡 `init`、`pipeline_trace` 0 行、session held open。对比 #165 引擎主动静音挂断 finalize 正常
 >   (`persisted=True`)。⇒ **修区 = 引擎 finalize-on-remote-hangup + edge 发显式 hangup CallEvent**；
 >   关联未跟踪 change `device-status-reset-on-call-end`（同片区）。详见 `[[project-session-20260607-handoff]]`。
+> - **🪜 复位阶梯诊断工具 (2026-06-09)**：`scripts/modem_capture_recover.py` 把上面只活在
+>   记忆里的 `capture_downlink.py` 正式化为 `probe` 模式，并加 `ladder` 模式——便宜→贵逐级复位
+>   **CPCMREG 重挂(门) → `CFUN=0/1`(射频栈) → `AT+CRESET`(固件) → host USB unbind/rebind
+>   (仅主机侧) → 物理重插**，停在第一个让 COM11 纯读恢复幅度(阈值 1000；健康 4000-5000)的 rung，
+>   把"哪级解决"追加进 `--results-file` JSONL。**一次性验掉本块 + §"SIM7600 USB audio uplink"
+>   的 `AT+CRESET 软复位能否替代物理重插` 待验**：rung 2/3 PASS ⇒ 坏态在 modem 固件层(软复位够)，
+>   仅 rung 4/5 PASS ⇒ 在主机/驱动层(单纯 unbind/rebind 才够)。rung 4 在 Linux 走 sysfs
+>   unbind→bind、Windows 走 `pnputil /restart-device`(自动找实例 id，解析不到打印手动命令+等回车)。
+>   Windows 真机：`.venv\Scripts\python.exe scripts\modem_capture_recover.py ladder --number <对端号>`，
+>   操作员接听后持续说话直到测完(uplink 只有对端发声才有幅度)。**仍未经真机验证**——下次 modem
+>   一进坏态即跑，把哪级解决回填本块。把"哪级解决"接成 orchestrator 自动恢复属行为变更，走 OpenSpec。
 >
 > **🎉 2026-06-06 — 全栈真拨 13301035545【完全打通】,"电话→AI" bug 已解决,
 > 13301035545 联合 MVP gate PASS。** 一通 ~114s 完整双向 AI 对话(call_record
@@ -467,7 +478,8 @@ overlapped WriteFile;③ **`AT+CFTRANRX` 灌大文件直接把整机 modem 搞�
   `write_chunk` **静默吞掉 `SerialTimeoutException`** —— 应改为:持续写超时
   = "OUT 卡死"信号 → 触发 modem 软复位(`AT+CRESET`/`AT+CFUN`)而非假装无事
   (踩中 root CLAUDE.md "多层 fallback / 静默兜底是坏味道")。
-- 边缘 daemon 会话初应从**干净 modem 状态**起步;验证软复位能否替代物理重插。
+- 边缘 daemon 会话初应从**干净 modem 状态**起步;验证软复位能否替代物理重插
+  (验证工具已就绪：`scripts/modem_capture_recover.py ladder`，详见顶部 §9 🪜 块)。
 - 严格 8K paced 写;禁用阻塞 `write_timeout=None`;音频口禁写错格式;禁
   `AT+CFTRANRX` 大文件。
 - **备选(文件式,非实时)** `AT+CCMXPLAYWAV="C:/x.wav",1` 送对端,本固件支持
