@@ -388,20 +388,128 @@ def phase_poll_call_record(args: argparse.Namespace) -> dict[str, Any]:
     return {"call_id": last_id, "status": last_status or "timeout", "transcript": transcript}
 
 
+def _fmt_ms(v: Any) -> str:
+    return f"{int(v)}ms" if isinstance(v, (int, float)) else "—"
+
+
+def _fmt_ts(ms: Any) -> str:
+    try:
+        return f"{float(ms) / 1000:.1f}s"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _gate_summary(referee_results: Any) -> str | None:
+    """One-line gate (referee) latency summary from a trace's referee_results."""
+    if not isinstance(referee_results, list) or not referee_results:
+        return None
+    parts = []
+    for r in referee_results:
+        if isinstance(r, dict):
+            parts.append(
+                f"{r.get('label', '?')} {_fmt_ms(r.get('duration_ms'))}"
+                f" ({r.get('category', '?')})"
+            )
+    return " · ".join(parts) if parts else None
+
+
+def phase_dialog_timeline(args: argparse.Namespace, result: dict[str, Any]) -> None:
+    """对话 + 分节点耗时视图 (engine-turn-latency-and-tts-guard).
+
+    每轮打印对话文本 + 两段耗时分解:
+      - 用户→LLM: ASR/排队 (用户说完 → PROCESSING 入口) + 门控 referee 耗时
+      - LLM→播放: 首 token → 首句 → 首音频 (各节点 + Δ) + 末 token + tokens
+    数据源 = pipeline_trace + call_record.transcript (脚本已有 ssh+psql 通道)。
+    """
+    call_id = result.get("call_id")
+    transcript = result.get("transcript")
+    if not isinstance(transcript, list) or not transcript:
+        print(f"\n  (call {call_id} transcript 不可用, 跳过时间线)", file=sys.stderr)
+        return
+
+    # pipeline_trace as a single JSON array; ts_start normalised to ms-from-call-start
+    # (comparable to transcript event ts) by subtracting call_record.started_at.
+    traces_json = ssh_cmd(
+        args.ssh_host, args.ssh_key,
+        f"{ECS_PSQL} \"SELECT COALESCE(json_agg(json_build_object("
+        f"'turn_id', turn_id, "
+        f"'ts_start_ms', round(extract(epoch from (ts_start - cr.started_at))*1000), "
+        f"'first_audio_ms', first_audio_ms, "
+        f"'first_token_ms', main_first_token_ms, "
+        f"'first_sentence_ms', main_first_sentence_ms, "
+        f"'duration_ms', main_duration_ms, "
+        f"'tin', main_tokens_in, 'tout', main_tokens_out, "
+        f"'restructure', restructure_active, "
+        f"'referee_results', referee_results, 'error', error) "
+        f"ORDER BY turn_id), '[]'::json) "
+        f"FROM pipeline_trace t JOIN call_record cr ON cr.id=t.call_record_id "
+        f"WHERE t.call_record_id={call_id};\""
+    )
+    try:
+        traces = json.loads(traces_json) if traces_json else []
+    except json.JSONDecodeError:
+        traces = []
+    by_turn = {t["turn_id"]: t for t in traces if isinstance(t, dict)}
+
+    print(f"\n=== 对话时间线 (call {call_id}) ===", file=sys.stderr)
+    last_user_ts: float | None = None
+    for ev in transcript:
+        if not isinstance(ev, dict):
+            continue
+        ts = ev.get("ts")
+        etype = ev.get("type", "?")
+        text = (ev.get("text") or "").strip()
+        head = f"  [{_fmt_ts(ts)}]"
+        if etype == "greeting":
+            print(f"{head} 🔊 开场白: {text}", file=sys.stderr)
+        elif etype == "user_speech":
+            last_user_ts = ts if isinstance(ts, (int, float)) else None
+            dur = ev.get("duration_ms")
+            extra = f"  (说话 {_fmt_ms(dur)})" if dur is not None else ""
+            print(f"{head} 👤 客户: {text}{extra}", file=sys.stderr)
+        elif etype == "ai_reply":
+            turn = ev.get("turn_id")
+            tr = by_turn.get(turn, {})
+            print(f"{head} 🤖 AI(turn{turn}): {text}", file=sys.stderr)
+            # 用户→LLM 段
+            u_parts: list[str] = []
+            ts_start_ms = tr.get("ts_start_ms")
+            if last_user_ts is not None and isinstance(ts_start_ms, (int, float)):
+                asr_ms = ts_start_ms - last_user_ts
+                if asr_ms >= 0:
+                    u_parts.append(f"ASR/排队 {int(asr_ms)}ms")
+            gate = _gate_summary(tr.get("referee_results"))
+            if gate:
+                u_parts.append(f"门控 {gate}")
+            if u_parts:
+                print(f"          用户→LLM | {' · '.join(u_parts)}", file=sys.stderr)
+            # LLM→播放 段 (各节点从 PROCESSING 入口起算)
+            ft, fs = tr.get("first_token_ms"), tr.get("first_sentence_ms")
+            fa, dur = tr.get("first_audio_ms"), tr.get("duration_ms")
+            seg = [f"首token {_fmt_ms(ft)}"]
+            if fs is not None:
+                d = f" (+{fs - ft})" if isinstance(ft, int) else ""
+                seg.append(f"首句 {int(fs)}ms{d}")
+            if fa is not None:
+                d = f" (+{fa - fs} TTS)" if isinstance(fs, int) else ""
+                seg.append(f"首音频 {int(fa)}ms{d}")
+            tail = f" · 末token {_fmt_ms(dur)} · tok {tr.get('tin')}→{tr.get('tout')}"
+            print(f"          LLM→播放 | {' → '.join(seg)}{tail}", file=sys.stderr)
+            if tr.get("error"):
+                print(f"          ⚠ error: {tr['error']}", file=sys.stderr)
+        elif etype == "silence_activation":
+            print(f"{head} 🔁 静默催促: {text}", file=sys.stderr)
+        elif etype == "interruption":
+            print(f"{head} ✋ 打断", file=sys.stderr)
+        elif etype == "hangup":
+            print(f"{head} ☎ 挂断 ({ev.get('reason', '')})", file=sys.stderr)
+
+
 def phase_listen_check(result: dict[str, Any]) -> bool:
     """Interactive yes/no on whether mac speaker actually played AI greeting."""
-    print("[6/6] listen check (人耳判断) ...", file=sys.stderr)
-    transcript = result.get("transcript")
-    if isinstance(transcript, list) and transcript:
-        print("\n  transcript snapshot:", file=sys.stderr)
-        for i, turn in enumerate(transcript[:8]):
-            speaker = turn.get("speaker", "?") if isinstance(turn, dict) else "?"
-            text = turn.get("text", str(turn)) if isinstance(turn, dict) else str(turn)
-            print(f"    [{i}] {speaker}: {text}", file=sys.stderr)
-    else:
-        print(f"  transcript empty / non-list: {transcript!r}", file=sys.stderr)
+    print("\n[6/6] listen check (人耳判断) ...", file=sys.stderr)
     print(
-        "\n  问题: mac 扬声器是否真听到 AI 开场白? (y/n)",
+        "  问题: mac 扬声器是否真听到 AI 开场白? (y/n)",
         file=sys.stderr,
     )
     ans = input("  → ").strip().lower()
@@ -494,6 +602,9 @@ def main() -> int:
             ssh_host=args.ssh_host, ssh_key=args.ssh_key, edge_log=EDGE_LOG_PATH,
         )
         print_report(report)
+
+        # [对话时间线] 对话文本 + 分节点耗时 (用户→LLM / LLM→播放)
+        phase_dialog_timeline(args, result)
 
         # listen-check 降级为可选辅助 (analyzer 是主判读); 默认仍问, --no-listen-check 跳过
         listened: bool | None = None
