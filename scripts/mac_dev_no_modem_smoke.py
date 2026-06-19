@@ -84,6 +84,9 @@ DEFAULT_DEVICE_ID = 1  # opaque forward field; engine 不查 PG device 表
 DEFAULT_RTC_FRAMEWORK = os.path.expanduser(
     "~/codes/vendor/DingRTC_macOS_SDK_3_9_0/DingRTC.framework"
 )
+# --record default dir (edge-local-call-recording). The spawned edge's
+# _build_recorder() reads ISALES_EDGE_RECORDINGS_DIR; --record just sets it.
+DEFAULT_RECORDINGS_DIR = "~/isales-recordings"
 META_REPO_ENGINE_ENV = "/Users/bears/codes/isales/deploy/cloud/env/engine.env"
 TELEPHONY_VENV_PY = "/Users/bears/codes/isales-telephony/.venv/bin/python"
 TELEPHONY_EDGE_BIN = (
@@ -229,6 +232,14 @@ def phase_start_edge(args: argparse.Namespace, jwt: str) -> subprocess.Popen[byt
         "ISALES_LOG_LEVEL": "INFO",
         **env_overrides,
     }
+    # --record DIR → enable edge-local recording (overrides any inherited
+    # ISALES_EDGE_RECORDINGS_DIR). Without --record the inherited env, if any,
+    # still passes through via **os.environ above.
+    if args.record:
+        rec_dir = Path(args.record).expanduser()
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        env["ISALES_EDGE_RECORDINGS_DIR"] = str(rec_dir)
+        print(f"  · recording ON → {rec_dir} (16kHz user+AI wav)", file=sys.stderr)
 
     ts = int(time.time())
     cmd = [
@@ -539,6 +550,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID)
     p.add_argument("--timeout", type=int, default=60,
                    help="call_record poll timeout seconds")
+    p.add_argument("--record", nargs="?", const=DEFAULT_RECORDINGS_DIR,
+                   default=None, metavar="DIR",
+                   help=f"edge-local call recording: tap user mic + AI playback "
+                        f"into 16kHz wav under DIR (default {DEFAULT_RECORDINGS_DIR} "
+                        f"when --record is given without a path). Sets "
+                        f"ISALES_EDGE_RECORDINGS_DIR for the spawned edge; "
+                        f"retention via ISALES_EDGE_MAX_RECORDINGS (default 10). "
+                        f"Omit --record to disable.")
     p.add_argument("--skip-edge-start", action="store_true",
                    help="assume edge daemon already running externally")
     p.add_argument("--no-listen-check", action="store_true",
@@ -561,6 +580,9 @@ def main() -> int:
         print(f"[dry-run] would ssh {args.ssh_host} (key {args.ssh_key})", file=sys.stderr)
         print(f"[dry-run] would mint JWT sub={args.edge_device_id} ttl={args.ttl}", file=sys.stderr)
         print(f"[dry-run] would spawn: {TELEPHONY_EDGE_BIN} --dev-no-modem", file=sys.stderr)
+        if args.record:
+            print(f"[dry-run] would record → {Path(args.record).expanduser()} "
+                  f"(ISALES_EDGE_RECORDINGS_DIR)", file=sys.stderr)
         print(f"[dry-run] would inject DialRequest(lead_id={args.lead_id}, "
               f"campaign_id={args.campaign_id}, phone={args.phone})", file=sys.stderr)
         print(f"[dry-run] would poll call_record for {args.timeout}s", file=sys.stderr)
