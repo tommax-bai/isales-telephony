@@ -1,18 +1,21 @@
 """Per-call stereo PCM recorder.
 
-Spec: device-hardware § PCM 音频管道 (recording is implied by the data-model
-``call_record.recording_url`` field; impl-worker uploads to OSS).
+Spec: transcript § Requirement: 录音存储 (edge-local-call-recording) —
+edge keeps the newest N recordings on local disk; no OSS upload in v1.0.
 
-Design (design.md § Decisions §8 + §13): write a stereo 16 kHz wav file
-locally with channel layout L=user (upstream from modem) / R=AI (TTS
-output before downsampling). On hangup, push to the worker's
-``recording-upload`` Redis list — worker uploads to OSS and clears the
-local file.
+Design (edge-local-call-recording): write a stereo 16 kHz wav file locally
+with channel layout L=user (upstream from modem) / R=AI (TTS output before
+downsampling). v1.0 keeps recordings edge-local only — on hangup the
+orchestrator finalizes the wav, then prunes the recordings dir to the
+newest ``MAX_RECORDINGS`` files. OSS upload + ``call_record.recording_url``
+write-back + frontend ``ts`` seek are v1.x (deferred); ``RedisRecordingQueue``
+below is kept for that future path but is NOT called in v1.0.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import shutil
@@ -82,6 +85,28 @@ class Recorder:
         logger.info("recording_finalized", call_id=call_id, path=str(path))
         return path
 
+    def prune(self, keep: int) -> None:
+        """Delete oldest ``*.wav`` so at most ``keep`` newest files remain.
+
+        Rolling retention for the edge-local recording path: callers invoke
+        this right after :meth:`finalize` so disk usage stays bounded to the
+        most recent ``keep`` calls. Ordering is by file mtime (newest kept).
+        ``keep <= 0`` is a no-op — disabling recording is the caller's job
+        (skip :meth:`begin_call`), not this method's, so a misconfigured
+        ``keep=0`` MUST NOT wipe the whole directory.
+        """
+
+        if keep <= 0:
+            return
+        wavs = sorted(
+            self._dir.glob("*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in wavs[keep:]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+
 
 def _write_stereo_wav(path: Path, left_chunks: list[bytes], right_chunks: list[bytes]) -> None:
     left = b"".join(left_chunks)
@@ -113,6 +138,12 @@ def file_sha256(path: Path) -> str:
 
 class RedisRecordingQueue:
     """Push finalised recordings onto the worker's upload list.
+
+    v1.x-reserved (edge-local-call-recording): the v1.0 recording path keeps
+    files edge-local and rolling — it does NOT call this class. Kept in place
+    for the future OSS-upload path (worker consumes ``worker:recording-upload``,
+    uploads to OSS, writes ``call_record.recording_url``). Removal trigger: if
+    the OSS path is cut from the roadmap, delete this class.
 
     The redis client is supplied by the caller so the same fakeredis-backed
     instance used elsewhere can be reused; production code injects a real

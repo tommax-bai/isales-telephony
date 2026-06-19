@@ -2,7 +2,7 @@
 
 Covers:
 - macOS branch (no ``app_id`` needed):
-  - PyObjC binding available → returns :class:`MacosArtcPyObjCSession`
+  - PyObjC binding available → returns :class:`MacosDingRtcPyObjCSession`
   - ImportError → fallback to :class:`MacosRtcSession` mock + WARN log
 - Linux branch (``app_id`` ignored): NotImplementedError.
 
@@ -28,27 +28,27 @@ def test_darwin_routes_to_pyobjc_when_available(fresh_bridge, monkeypatch):
 
     monkeypatch.setattr(audio_bridge.sys, "platform", "darwin", raising=False)
     cls = audio_bridge.get_default_rtc_session_factory()
-    assert cls.__name__ == "MacosArtcPyObjCSession"
+    assert cls.__name__ == "MacosDingRtcPyObjCSession"
 
 
 def test_darwin_falls_back_to_mock_when_pyobjc_missing(
     monkeypatch, caplog: pytest.LogCaptureFixture,
 ):
-    """ImportError during macos_artc_pyobjc import → WARN log + MacosRtcSession."""
+    """ImportError during macos_dingrtc_pyobjc import → WARN log + MacosRtcSession."""
     from isales_telephony import audio_bridge
     from isales_telephony.audio_bridge.session import MacosRtcSession
 
     # Ensure a fresh import path: drop any cached bridge module, then
     # block re-import by interposing on builtins.__import__.
     monkeypatch.delitem(
-        sys.modules, "isales_telephony.audio_bridge.macos_artc_pyobjc",
+        sys.modules, "isales_telephony.audio_bridge.macos_dingrtc_pyobjc",
         raising=False,
     )
 
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name == "isales_telephony.audio_bridge.macos_artc_pyobjc":
+        if name == "isales_telephony.audio_bridge.macos_dingrtc_pyobjc":
             raise ImportError("pyobjc-core not installed (test)")
         return real_import(name, *args, **kwargs)
 
@@ -60,7 +60,7 @@ def test_darwin_falls_back_to_mock_when_pyobjc_missing(
 
     assert cls is MacosRtcSession
     assert any(
-        "macos_artc_pyobjc_unavailable_fallback_to_mock" in r.message
+        "macos_dingrtc_pyobjc_unavailable_fallback_to_mock" in r.message
         for r in caplog.records
     )
 

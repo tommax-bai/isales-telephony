@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -38,6 +39,9 @@ from isales_common.audio.rtc import (
 
 from isales_telephony.audio_bridge.resampler import Resampler
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
+
+if TYPE_CHECKING:
+    from isales_telephony.modem_controller.recorder import Recorder
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,14 @@ class AudioBridge:
         modem_rate: modem-side PCM rate in Hz (8000 for GSM).
         rtc_rate: RTC wire PCM rate in Hz (16000 for the iSales
             convention, configurable per call to match the engine).
+        recorder: optional per-call stereo recorder (edge-local-call-
+            recording). When provided together with ``record_call_id``,
+            the upstream pump taps the user PCM and the downstream pump
+            taps the AI PCM into it. ``None`` → recording disabled.
+        record_call_id: the recorder call key (iSales convention: the
+            call_id). The orchestrator must have already called
+            ``recorder.begin_call(record_call_id)``; the bridge only
+            appends frames and never begins / finalizes.
 
     Construction is decoupled from connecting — call :meth:`join` to
     actually open the RTC session and start the pumps.
@@ -88,6 +100,8 @@ class AudioBridge:
         peer_uid: str,
         modem_rate: int = 8000,
         rtc_rate: int = 16000,
+        recorder: Recorder | None = None,
+        record_call_id: str | None = None,
     ) -> None:
         if not peer_uid:
             raise ValueError("peer_uid must be non-empty")
@@ -97,6 +111,13 @@ class AudioBridge:
         self._peer_uid = peer_uid
         self._modem_rate = modem_rate
         self._rtc_rate = rtc_rate
+        # edge-local-call-recording: when set, tap both PCM directions into
+        # the per-call stereo recorder (L=user upstream, R=AI downstream).
+        # Both taps feed 16 kHz (rtc_rate) PCM so they line up with the
+        # recorder's ENGINE_SAMPLE_RATE wav; begin_call / finalize / prune are
+        # driven by the orchestrator, not here. None → recording off.
+        self._recorder = recorder
+        self._record_call_id = record_call_id if recorder is not None else None
         self._up_resampler = Resampler(modem_rate, rtc_rate)
         self._down_resampler = Resampler(rtc_rate, modem_rate)
         self._upstream_task: asyncio.Task[None] | None = None
@@ -224,6 +245,10 @@ class AudioBridge:
                         len(chunk),
                         len(resampled),
                     )
+                # edge-local-call-recording: tap the user (left) channel at
+                # rtc_rate (16 kHz) — same PCM we just pushed to RTC.
+                if self._recorder is not None and self._record_call_id is not None:
+                    self._recorder.append_user(self._record_call_id, resampled)
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001
@@ -250,6 +275,12 @@ class AudioBridge:
                 if frame.sender_uid and frame.sender_uid != self._peer_uid:
                     self.stats.downstream_uid_filtered += 1
                     continue
+                # edge-local-call-recording: tap the AI (right) channel at
+                # rtc_rate (16 kHz) — frame.pcm is the cloud TTS *before*
+                # downsampling to the modem, so it lines up with the user
+                # tap and the recorder's 16 kHz wav.
+                if self._recorder is not None and self._record_call_id is not None:
+                    self._recorder.append_ai(self._record_call_id, frame.pcm)
                 # Resample RTC frame → 8kHz mono for the SIM7600 audio port.
                 # DingRTC frames are typically 48kHz stereo, but the rate MUST
                 # come from frame.sample_rate (SSOT) — NOT a hardcoded 48kHz/6

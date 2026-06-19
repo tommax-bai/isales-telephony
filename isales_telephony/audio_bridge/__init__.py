@@ -69,7 +69,7 @@ def get_default_rtc_session_factory(
       (DingRTC via pybind11 from ``deploy/edge/windows/pybind/dingrtc_pywrap/``).
       ``app_id`` is REQUIRED — DingRTC's RtcEngineAuthInfo bundles AppId at
       construction time, not per-join.
-    - ``darwin`` → :class:`MacosArtcPyObjCSession` (PyObjC bridge, dev / QA)
+    - ``darwin`` → :class:`MacosDingRtcPyObjCSession` (PyObjC bridge, dev / QA)
       when ``[macos-dingrtc]`` extras + ``DingRTC.framework`` are present.
       Falls back to :class:`MacosRtcSession` mock loopback (WARN log + install
       hint). ``app_id`` is unused on macOS — the Mac PyObjC class manages
@@ -93,19 +93,20 @@ def get_default_rtc_session_factory(
         return partial(WindowsDingRtcSession, app_id=app_id)
     if sys.platform == "darwin":
         try:
-            from isales_telephony.audio_bridge.macos_artc_pyobjc import (
-                MacosArtcPyObjCSession,
+            from isales_telephony.audio_bridge.macos_dingrtc_pyobjc import (
+                MacosDingRtcPyObjCSession,
             )
-            return MacosArtcPyObjCSession
+            return MacosDingRtcPyObjCSession
         except ImportError as exc:
             logger.warning(
-                "macos_artc_pyobjc_unavailable_fallback_to_mock",
+                "macos_dingrtc_pyobjc_unavailable_fallback_to_mock",
                 extra={
                     "detail": str(exc),
                     "hint": (
                         "pip install -e '.[macos-dingrtc]' and unzip "
-                        "DingRTC_macOS_SDK_3_9_0 to ~/codes/vendor/ "
-                        "to enable real DingRTC on macOS dev / QA"
+                        "DingRTC_macOS_SDK_3_9_0.zip to "
+                        "~/codes/vendor/DingRTC_macOS_SDK_3_9_0/ to enable "
+                        "real DingRTC on macOS dev / QA"
                     ),
                 },
             )

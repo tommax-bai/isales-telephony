@@ -7,9 +7,11 @@ manual smoke (see ``deploy/edge/macos/RUNBOOK.md``).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from isales_telephony.edge.main import build_argparser, run
+from isales_telephony.edge.main import _build_recorder, build_argparser, run
 
 
 def test_argparser_defaults_to_production_mode():
@@ -65,3 +67,37 @@ def test_dev_no_modem_guard_lets_darwin_through(monkeypatch):
     monkeypatch.setattr(main_mod.asyncio, "run", _fake_asyncio_run)
     run(["--dev-no-modem", "--dev-channel", "c", "--dev-uid", "u"])
     assert called == [True]
+
+
+# ---- _build_recorder (edge-local-call-recording) ------------------------
+
+
+def test_build_recorder_disabled_when_dir_unset(monkeypatch):
+    monkeypatch.delenv("ISALES_EDGE_RECORDINGS_DIR", raising=False)
+    recorder, max_recordings = _build_recorder()
+    assert recorder is None
+    assert max_recordings == 0
+
+
+def test_build_recorder_disabled_when_max_zero(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ISALES_EDGE_RECORDINGS_DIR", str(tmp_path))
+    monkeypatch.setenv("ISALES_EDGE_MAX_RECORDINGS", "0")
+    recorder, max_recordings = _build_recorder()
+    assert recorder is None
+    assert max_recordings == 0
+
+
+def test_build_recorder_enabled_defaults_to_ten(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ISALES_EDGE_RECORDINGS_DIR", str(tmp_path))
+    monkeypatch.delenv("ISALES_EDGE_MAX_RECORDINGS", raising=False)
+    recorder, max_recordings = _build_recorder()
+    assert recorder is not None
+    assert max_recordings == 10
+
+
+def test_build_recorder_honours_custom_max(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ISALES_EDGE_RECORDINGS_DIR", str(tmp_path))
+    monkeypatch.setenv("ISALES_EDGE_MAX_RECORDINGS", "3")
+    recorder, max_recordings = _build_recorder()
+    assert recorder is not None
+    assert max_recordings == 3

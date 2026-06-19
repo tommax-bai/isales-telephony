@@ -35,9 +35,12 @@ Dev / QA mode (macOS only):
 
 - ``--dev-no-modem`` skips the modem stack entirely. The orchestrator
   routes Cloud2Edge.dial straight into ``rtc_session.join`` using the
-  real Aliyun ARTC PaaS via :class:`MacosArtcPyObjCSession`. mac mic /
-  speaker are handled by the ARTC SDK's default audio device routing.
-  Spec: openspec/changes/macos-artc-pyobjc-binding/.
+  real Aliyun RTC PaaS (DingRTC 3.x) via
+  :class:`MacosDingRtcPyObjCSession`. mac mic / speaker are pumped
+  through the audio_bridge external-audio-source path (the DingRTC SDK
+  takes PCM via :meth:`push_audio` / :meth:`audio_frames`; the SDK's
+  internal Core Audio capture is not used).
+  Spec: openspec/changes/engine-rtc-dingrtc-migration § 8.
 
 Shutdown: SIGTERM triggers an asyncio cancellation that propagates
 through the task group; the orchestrator's :meth:`stop` runs cleanly
@@ -53,6 +56,7 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 
 from isales_telephony.audio_bridge import get_default_rtc_session_factory
 from isales_telephony.edge.grpc_heartbeat import grpc_heartbeat_loop
@@ -62,6 +66,7 @@ from isales_telephony.modem_controller.audio_pipe import (
     PlaybackBackend,
 )
 from isales_telephony.modem_controller.main import _make_at_client
+from isales_telephony.modem_controller.recorder import Recorder
 from isales_telephony.transport.grpc_client import CloudEdgeGrpcClient
 from isales_telephony.transport.sqlite_buffer import SqliteEventBuffer
 
@@ -136,6 +141,26 @@ def _build_audio_backends(
         playback.adopt_serial_from(capture)
         return capture, playback
     raise RuntimeError(f"unknown ISALES_EDGE_AUDIO_BACKEND={backend!r}")
+
+
+def _build_recorder() -> tuple[Recorder | None, int]:
+    """Resolve the edge-local call recorder from env (edge-local-call-recording).
+
+    - ``ISALES_EDGE_RECORDINGS_DIR`` unset → recording disabled (returns
+      ``(None, 0)``). The product feature is opt-in per deploy.
+    - ``ISALES_EDGE_MAX_RECORDINGS`` (default 10) → rolling retention by file
+      count; ``0`` also disables recording.
+    - ``ISALES_EDGE_RECORDING_MIN_FREE_GB`` (default 1) → disk floor; a call
+      that starts with less free space is skipped (warning), call continues.
+
+    Recordings stay edge-local — no OSS upload, no DB write-back (v1.x).
+    """
+    rec_dir = os.environ.get("ISALES_EDGE_RECORDINGS_DIR")
+    max_recordings = int(os.environ.get("ISALES_EDGE_MAX_RECORDINGS", "10"))
+    if not rec_dir or max_recordings <= 0:
+        return None, 0
+    min_free_gb = int(os.environ.get("ISALES_EDGE_RECORDING_MIN_FREE_GB", "1"))
+    return Recorder(Path(rec_dir), min_free_gb=min_free_gb), max_recordings
 
 
 def _build_event_buffer() -> SqliteEventBuffer | None:
@@ -234,6 +259,7 @@ async def _arun_real(args: argparse.Namespace) -> None:
     logger.info("audio_backends_built")
     event_buffer = _build_event_buffer()
     logger.info("connecting_grpc endpoint=%s", endpoint)
+    recorder, max_recordings = _build_recorder()
 
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
     orchestrator = EdgeOrchestrator(
@@ -244,6 +270,8 @@ async def _arun_real(args: argparse.Namespace) -> None:
         rtc_session_factory=get_default_rtc_session_factory(
             app_id=os.environ.get("ISALES_RTC_APP_ID", ""),
         ),
+        recorder=recorder,
+        max_recordings=max_recordings,
     )
 
     stop_event = asyncio.Event()
@@ -328,15 +356,34 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
         logger.warning("ISALES_DEVICE_ID not set; gRPC heartbeat will be disabled (dev)")
 
     grpc_client = CloudEdgeGrpcClient(event_buffer=event_buffer)
+
+    # dev path 走真 DingRTC 时必须经 `.production()` classmethod 拿 app_id —
+    # main 的 factory 在 darwin 臂返回裸 MacosDingRtcPyObjCSession 类
+    # (app_id="" default)，直接零参调用会在 `.join()` 阶段 RtcError；其
+    # `.production()` classmethod 从 ISALES_RTC_APP_ID 注入 app_id。
+    # win32 臂返回 partial(WindowsDingRtcSession, app_id=...) (无 production,
+    # app_id 已绑定)，mock MacosRtcSession 也没有 production() — 两者均落到
+    # raw factory fallback。
+    _rtc_factory = get_default_rtc_session_factory(
+        app_id=os.environ.get("ISALES_RTC_APP_ID", ""),
+    )
+    _rtc_production = getattr(_rtc_factory, "production", None)
+    rtc_session_factory = _rtc_production if _rtc_production is not None else _rtc_factory
+
+    # edge-local-call-recording: same env-gated recorder as the modem path
+    # (§ _build_recorder). dev-no-modem taps user mic + AI playback into it
+    # (orchestrator._dev_no_modem_*); unset ISALES_EDGE_RECORDINGS_DIR → off.
+    recorder, max_recordings = _build_recorder()
+
     orchestrator = EdgeOrchestrator(
         grpc_client=grpc_client,
-        rtc_session_factory=get_default_rtc_session_factory(
-            app_id=os.environ.get("ISALES_RTC_APP_ID", ""),
-        ),
+        rtc_session_factory=rtc_session_factory,
         dev_no_modem=True,
         dev_channel=args.dev_channel,
         dev_uid=args.dev_uid,
         dev_peer_uid=args.dev_peer_uid,
+        recorder=recorder,
+        max_recordings=max_recordings,
     )
 
     stop_event = asyncio.Event()
@@ -403,7 +450,11 @@ async def _arun_dev_no_modem(args: argparse.Namespace) -> None:
 
 
 async def _arun(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=os.environ.get("ISALES_LOG_LEVEL", "INFO"))
+    logging.basicConfig(
+        level=os.environ.get("ISALES_LOG_LEVEL", "INFO"),
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
     if args.dev_no_modem:
         await _arun_dev_no_modem(args)
     else:

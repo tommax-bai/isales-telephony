@@ -52,15 +52,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyped]
+from isales_common.audio.rtc import RtcNotJoined, RtcSession
 from isales_common.proto import cloud_edge_pb2 as pb
 from isales_common.transport.cloud_edge import CloudEdgeClient
-
-from isales_common.audio.rtc import RtcSession
 
 from isales_telephony.audio_bridge.bridge import AudioBridge
 from isales_telephony.audio_bridge.ring_buffer import PcmRingBuffer
@@ -77,9 +77,10 @@ from isales_telephony.modem_controller.at_client import (
 )
 from isales_telephony.modem_controller.audio_pipe import (
     CaptureBackend,
+    ENGINE_SAMPLE_RATE,
     PlaybackBackend,
 )
-
+from isales_telephony.modem_controller.recorder import DiskFullError, Recorder
 
 # AT command stage label for the HardwareAlert emitted when AT+CPCMREG=1
 # fails on call connect. Spec § "PCM 通道按 SIMCom AT 协议启停 (CPCMREG)"
@@ -105,6 +106,40 @@ _HANGUP_CAUSE_TO_PROTO: dict[str, int] = {
     "user_hangup": int(pb.HangupCause.HANGUP_CAUSE_NORMAL_CLEARING),
     "manual_hangup": int(pb.HangupCause.HANGUP_CAUSE_NORMAL_CLEARING),
 }
+
+
+def _downmix_playback_to_engine_mono(
+    pcm: bytes, src_rate: int, src_channels: int,
+) -> bytes:
+    """DingRTC playback PCM → ``ENGINE_SAMPLE_RATE`` mono int16.
+
+    edge-local-call-recording, dev-no-modem path only. The recorder writes a
+    16 kHz wav whose left (user) channel is already 16 kHz mono mac-mic PCM;
+    the AI (right) channel arrives from the mac DingRTC SDK's
+    ``onPlaybackAudioFrame`` as 48 kHz **stereo** (observed sr=48000 ch=2), so
+    it must be downmixed + resampled to line up before ``append_ai``. The
+    modem path tap (``bridge.py``) gets cloud PCM already at 16 kHz mono and
+    needs none of this. ``audioop`` is gone in Py 3.14, so use numpy (already
+    a recorder dependency). Linear interpolation handles any src_rate, not
+    just the exact 3:1 case.
+    """
+    if not pcm:
+        return b""
+    import numpy as np  # noqa: PLC0415
+
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+    if src_channels and src_channels > 1:
+        usable = (samples.size // src_channels) * src_channels
+        samples = samples[:usable].reshape(-1, src_channels).mean(axis=1)
+    if src_rate and src_rate != ENGINE_SAMPLE_RATE and samples.size:
+        n_out = int(round(samples.size * ENGINE_SAMPLE_RATE / src_rate))
+        if n_out > 0:
+            samples = np.interp(
+                np.linspace(0, samples.size - 1, n_out),
+                np.arange(samples.size),
+                samples,
+            )
+    return np.clip(np.round(samples), -32768, 32767).astype("<i2").tobytes()
 
 
 RtcSessionFactory = Callable[[], RtcSession]
@@ -133,6 +168,11 @@ class _CallContext:
     upstream: PcmRingBuffer | None = None
     downstream: PcmRingBuffer | None = None
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    # edge-local-call-recording: set in _handle_connected once begin_call
+    # succeeded for this call. teardown finalizes the wav + prunes the dir.
+    # None → recording was off / disk-full skipped for this call.
+    recorder: Recorder | None = None
+    max_recordings: int = 0
     # dev-no-modem path stashes the RtcSession directly (no AudioBridge
     # wrapping it, because there is no modem PCM stream to bridge to).
     # teardown() calls leave() on it like it would on bridge.
@@ -174,6 +214,16 @@ class _CallContext:
             with contextlib.suppress(Exception):
                 await self.bridge.leave()
             self.bridge = None
+        # edge-local-call-recording: bridge.leave() has stopped the pumps, so
+        # no more append_user / append_ai land after this. Finalize the wav
+        # and roll the dir to the newest N. Best-effort — a recording failure
+        # must never block call teardown.
+        if self.recorder is not None:
+            with contextlib.suppress(Exception):
+                self.recorder.finalize(self.call_id)
+            with contextlib.suppress(Exception):
+                self.recorder.prune(self.max_recordings)
+            self.recorder = None
         # dev-no-modem: rtc_session is owned directly, not via AudioBridge.
         if self.rtc_session is not None:
             with contextlib.suppress(Exception):
@@ -210,6 +260,10 @@ class EdgeOrchestrator:
         ring_capacity_bytes: per-call ring buffer cap. Default 32 KiB
             (~1 s @ 16 kHz mono int16) — well above the 200 ms spec
             floor for jitter absorption.
+        recorder: optional edge-local stereo recorder (edge-local-call-
+            recording). ``None`` (default) disables recording.
+        max_recordings: rolling retention — keep this many newest wavs in
+            the recorder's dir, prune the rest on each call teardown.
     """
 
     def __init__(
@@ -221,6 +275,8 @@ class EdgeOrchestrator:
         playback: PlaybackBackend | None = None,
         rtc_session_factory: RtcSessionFactory | None = None,
         ring_capacity_bytes: int = 32 * 1024,
+        recorder: Recorder | None = None,
+        max_recordings: int = 0,
         dev_no_modem: bool = False,
         dev_channel: str | None = None,
         dev_uid: str | None = None,
@@ -234,6 +290,12 @@ class EdgeOrchestrator:
             rtc_session_factory if rtc_session_factory is not None else MacosRtcSession
         )
         self._ring_capacity = ring_capacity_bytes
+        # edge-local-call-recording: a single shared recorder (single-modem =
+        # one call at a time, keyed by call_id). None → recording disabled.
+        # Only the modem path (AudioBridge) records; dev-no-modem has no
+        # downstream loop so the AI channel isn't reachable there.
+        self._recorder = recorder
+        self._max_recordings = max_recordings
         self._calls: dict[str, _CallContext] = {}
         # Audio capture / playback are HW-scoped, not per-call. The
         # active call's pumps are wired to the active call's ring
@@ -431,11 +493,29 @@ class EdgeOrchestrator:
             capacity_bytes=self._ring_capacity,
             name=f"modem_downstream_{ctx.call_id}",
         )
+        # edge-local-call-recording: begin recording before building the
+        # bridge so the pumps can tap PCM from their first frame. DiskFullError
+        # → skip recording for this call (logged); the call itself continues.
+        record_recorder: Recorder | None = None
+        if self._recorder is not None and self._max_recordings > 0:
+            try:
+                self._recorder.begin_call(ctx.call_id)
+                record_recorder = self._recorder
+                ctx.recorder = self._recorder
+                ctx.max_recordings = self._max_recordings
+            except DiskFullError as exc:
+                logger.warning(
+                    "recording_skipped_disk_full",
+                    extra={"call_id": ctx.call_id, "detail": str(exc)},
+                )
+
         bridge = AudioBridge(
             rtc_session=self._rtc_factory(),
             modem_upstream=upstream,
             modem_downstream=downstream,
             peer_uid=dial.rtc_uid_engine,
+            recorder=record_recorder,
+            record_call_id=ctx.call_id if record_recorder is not None else None,
         )
         ctx.upstream = upstream
         ctx.downstream = downstream
@@ -537,6 +617,173 @@ class EdgeOrchestrator:
             )
             await self._handle_remote_hangup(ctx, cause="network_out_of_order")
             return
+
+        # edge-local-call-recording (dev-no-modem): the modem path records via
+        # AudioBridge taps, but dev-no-modem owns the RtcSession directly, so
+        # wire the recorder here. begin_call before starting the pumps so the
+        # very first user / AI frame is captured. DiskFullError → skip
+        # recording for this call (logged); the call itself continues.
+        recording = False
+        if self._recorder is not None and self._max_recordings > 0:
+            try:
+                self._recorder.begin_call(call_id)
+                ctx.recorder = self._recorder
+                ctx.max_recordings = self._max_recordings
+                recording = True
+            except DiskFullError as exc:
+                logger.warning(
+                    "recording_skipped_disk_full",
+                    extra={"call_id": call_id, "detail": str(exc)},
+                )
+            if recording:
+                # AI (right) channel: drain the playback PCM the SDK would
+                # otherwise drop (no audio_frames() consumer in dev-no-modem)
+                # and tap it into the recorder. Started before the mic pump so
+                # both channels begin at the same wall-clock point.
+                ctx.tasks.append(
+                    asyncio.create_task(
+                        self._dev_no_modem_ai_recording_pump(ctx, rtc_session),
+                        name=f"ai_record_{call_id}",
+                    )
+                )
+
+        # Start mic capture pump for upstream audio. MacosDingRtcPyObjCSession
+        # calls setExternalAudioSource(true, ...) which **disables** the SDK's
+        # default Core Audio mic capture — we must push mic PCM manually for
+        # the engine-side audio_frames() iterator to see anything other than
+        # silence. Without this, ASR receives 0 bytes and the silence_activation
+        # state machine fires until silence_max_reached (smoke calls 1-8 all
+        # took this path before this commit). 16 kHz mono 16-bit LE matches
+        # DingRTC engine-side send_sample_rate default (RtcSession ABC).
+        #
+        # Set ``ISALES_DEV_NO_MIC_CAPTURE=1`` to skip the pump (diagnostic
+        # toggle — useful when isolating whether mic upstream interferes
+        # with engine-side TTS push_audio path).
+        if os.environ.get("ISALES_DEV_NO_MIC_CAPTURE") != "1":
+            ctx.tasks.append(
+                asyncio.create_task(
+                    self._dev_no_modem_mic_capture_pump(ctx, rtc_session),
+                    name=f"mic_capture_{call_id}",
+                )
+            )
+
+    async def _dev_no_modem_mic_capture_pump(
+        self,
+        ctx: _CallContext,
+        rtc_session: RtcSession,
+    ) -> None:
+        """mac mic → rtc_session.push_audio loop for dev-no-modem path.
+
+        Runs until ``ctx.terminated`` flips or the task is cancelled by
+        :meth:`_CallContext.teardown`. Capture is opened lazily on first
+        ``read_chunk()`` and closed in the ``finally``. push_audio errors
+        are logged and swallowed — losing one 20 ms frame is not fatal
+        for the AI dialog turn.
+        """
+        from isales_telephony.audio_bridge.mac_mic_capture import (  # noqa: PLC0415
+            MacMicCapture,
+        )
+
+        capture = MacMicCapture()
+        ts_ms = 0
+        # DIAG-REMOVE-AFTER-MIC-DEBUG: per-second push count + bytes + max RMS
+        import time as _time  # noqa: PLC0415
+        _last_log_t = _time.monotonic()
+        _chunks_window = 0
+        _bytes_window = 0
+        _max_rms_window = 0
+        try:
+            capture.open()
+            chunk_ms = capture.chunk_duration_ms
+            while not ctx.terminated:
+                chunk = await capture.read_chunk()
+                try:
+                    await rtc_session.push_audio(chunk, timestamp_ms=ts_ms)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dev_no_modem_mic_push_audio_failed call_id=%s err=%s",
+                        ctx.call_id, exc,
+                    )
+                # edge-local-call-recording: tap the user (left) channel — the
+                # same 16 kHz mono PCM we just pushed to RTC, no conversion
+                # needed (matches the recorder's 16 kHz wav).
+                if ctx.recorder is not None:
+                    ctx.recorder.append_user(ctx.call_id, chunk)
+                ts_ms += chunk_ms
+                # DIAG-REMOVE-AFTER-MIC-DEBUG begin ------------------------
+                _chunks_window += 1
+                _bytes_window += len(chunk)
+                if chunk and len(chunk) >= 2:
+                    _sample_count = len(chunk) // 2
+                    _stride = max(1, _sample_count // 32)
+                    _total = 0
+                    _seen = 0
+                    for _i in range(0, len(chunk), _stride * 2):
+                        if _i + 2 > len(chunk):
+                            break
+                        _s = int.from_bytes(chunk[_i:_i + 2], "little", signed=True)
+                        _total += _s * _s
+                        _seen += 1
+                    if _seen:
+                        _rms = int((_total // _seen) ** 0.5)
+                        if _rms > _max_rms_window:
+                            _max_rms_window = _rms
+                _now = _time.monotonic()
+                if _now - _last_log_t >= 1.0:
+                    logger.info(
+                        "dev_no_modem_mic_push_1s call_id=%s chunks=%s "
+                        "bytes=%s max_rms=%s ts_ms=%s",
+                        ctx.call_id, _chunks_window, _bytes_window,
+                        _max_rms_window, ts_ms,
+                    )
+                    _last_log_t = _now
+                    _chunks_window = 0
+                    _bytes_window = 0
+                    _max_rms_window = 0
+                # DIAG-REMOVE-AFTER-MIC-DEBUG end --------------------------
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "dev_no_modem_mic_capture_pump_failed call_id=%s", ctx.call_id,
+            )
+        finally:
+            capture.stop()
+
+    async def _dev_no_modem_ai_recording_pump(
+        self,
+        ctx: _CallContext,
+        rtc_session: RtcSession,
+    ) -> None:
+        """rtc_session.audio_frames() → recorder.append_ai (edge-local-recording).
+
+        The AI (right) channel of the dev-no-modem recording. The SDK renders
+        playback to the mac speaker via its own observer; nothing else consumes
+        ``audio_frames()`` on this path, so the playback queue would just
+        drop-oldest. This pump drains it and downmixes each frame (mac SDK
+        delivers 48 kHz stereo) to ``ENGINE_SAMPLE_RATE`` mono before
+        ``append_ai``. Runs until ``ctx.terminated`` or task cancellation by
+        teardown (which then finalizes the wav). Errors are logged and
+        swallowed — a recording glitch must never take down the call.
+        """
+        try:
+            async for frame in rtc_session.audio_frames():
+                if ctx.terminated or ctx.recorder is None:
+                    break
+                mono16k = _downmix_playback_to_engine_mono(
+                    frame.pcm, frame.sample_rate, frame.channels,
+                )
+                if mono16k:
+                    ctx.recorder.append_ai(ctx.call_id, mono16k)
+        except asyncio.CancelledError:
+            raise
+        except RtcNotJoined:
+            # leave() won the race with teardown's task-cancel — benign.
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "dev_no_modem_ai_recording_pump_failed call_id=%s", ctx.call_id,
+            )
 
     async def dev_terminate_active_calls(self) -> None:
         """Emit remote_hangup{dev_terminate} for every in-flight call.

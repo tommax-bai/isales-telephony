@@ -70,20 +70,32 @@ linux = [
 macos = [
     'sounddevice>=0.4.6',
 ]
-# macOS dev / QA ARTC extras (macos-artc-pyobjc-binding).
+# macOS dev / QA DingRTC extras (engine-rtc-dingrtc-migration § 8).
 #
 # Optional PyObjC bindings used by
-# isales_telephony.audio_bridge.macos_artc_pyobjc to load the Aliyun
-# macOS ARTC framework (Obj-C only) into a Python process. ONLY needed
-# on macOS dev / QA hosts that want to join real RTC channels — CI,
-# unit-test, and the Windows commercial path are unaffected.
+# isales_telephony.audio_bridge.macos_dingrtc_pyobjc to load the
+# DingRTC macOS framework (Obj-C only) into a Python process. ONLY
+# needed on macOS dev / QA hosts that want to join real DingRTC
+# channels — CI, unit-test, and the Windows commercial path are
+# unaffected.
 #
-# The Aliyun framework itself ships as `AliRTCSdk.framework` and is
+# The DingRTC framework itself ships as `DingRTC.framework` and is
 # NOT installed by pip; per `reference_artc_sdk.md` it lives under
-# `~/codes/vendor/AliRTCSdk_macos/` and is gitignored. The binding
-# loads it via `objc.loadBundle(bundle_path=...)`.
+# `~/codes/vendor/DingRTC_macOS_SDK_3_9_0/` and is gitignored. The
+# binding pre-loads sibling deps via ctypes.CDLL(RTLD_GLOBAL) then
+# resolves the Obj-C classes via objc.lookUpClass (objc.loadBundle is
+# best-effort for formal-protocol registration only).
 #
 # Markers MUST keep non-macOS installs clean.
+macos-dingrtc = [
+    'pyobjc-core>=10.0; platform_system == "Darwin"',
+    'pyobjc-framework-Cocoa>=10.0; platform_system == "Darwin"',
+]
+# Deprecated alias kept one release post-dingrtc-migration archive so
+# existing macOS dev environments installed with the old `[macos-artc]`
+# extras continue to resolve to the same pyobjc deps. Remove when the
+# `macos_artc_pyobjc.py` removal (§ 8.9) hits a release tag. New
+# installs SHOULD use `macos-dingrtc`.
 macos-artc = [
     'pyobjc-core>=10.0; platform_system == "Darwin"',
     'pyobjc-framework-Cocoa>=10.0; platform_system == "Darwin"',

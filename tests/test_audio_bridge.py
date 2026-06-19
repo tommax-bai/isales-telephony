@@ -21,6 +21,8 @@ Test strategy:
 from __future__ import annotations
 
 import asyncio
+import wave
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -33,6 +35,7 @@ from isales_telephony.audio_bridge import (
     PcmRingBuffer,
     Resampler,
 )
+from isales_telephony.modem_controller.recorder import Recorder
 
 # ==========================================================================
 # PcmRingBuffer
@@ -364,6 +367,91 @@ async def test_bridge_filters_frames_from_unexpected_uid() -> None:
     await bridge.leave()
     await engine_session.leave()
     await third_session.leave()
+
+
+# ==========================================================================
+# AudioBridge × Recorder (edge-local-call-recording)
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_bridge_records_both_channels_to_stereo_wav(tmp_path: Path) -> None:
+    """The bridge taps user upstream (left) and AI downstream (right) into a
+    Recorder; finalize yields a 16 kHz stereo wav with energy on both
+    channels. Mirrors the orchestrator contract: it calls begin_call /
+    finalize / prune; the bridge only appends."""
+    recorder = Recorder(tmp_path)
+    recorder.begin_call("call-rec")  # orchestrator does this on connect
+
+    edge_session = MacosRtcSession()
+    engine_session = MacosRtcSession()
+    modem_up = PcmRingBuffer(capacity_bytes=8 * 1024, name="up")
+    modem_down = PcmRingBuffer(capacity_bytes=8 * 1024, name="down")
+    bridge = AudioBridge(
+        rtc_session=edge_session,
+        modem_upstream=modem_up,
+        modem_downstream=modem_down,
+        peer_uid="engine-c1",
+        recorder=recorder,
+        record_call_id="call-rec",
+    )
+    await bridge.join(channel="c1", token="t", uid="edge-c1")
+    await engine_session.join(channel="c1", token="t", uid="engine-c1")
+
+    # User upstream: 8 kHz tone → bridge resamples to 16 kHz → left channel.
+    await modem_up.put(_tone(20, rate=8000))
+    # AI downstream: engine pushes 16 kHz tone → bridge taps frame.pcm → right.
+    await engine_session.push_audio(_tone(20, rate=16000), timestamp_ms=0)
+
+    # Drain both directions so the pumps have certainly run their taps.
+    up_iter = engine_session.audio_frames()
+    await asyncio.wait_for(anext(up_iter), timeout=1.0)
+    await asyncio.wait_for(modem_down.get(), timeout=1.0)
+    await asyncio.sleep(0.05)
+
+    await bridge.leave()
+    await engine_session.leave()
+
+    # Orchestrator-side finalize + prune.
+    path = recorder.finalize("call-rec")
+    recorder.prune(keep=10)
+    assert path is not None and path.exists()
+    with wave.open(str(path), "rb") as wav:
+        assert wav.getnchannels() == 2
+        assert wav.getframerate() == 16000
+        assert wav.getnframes() > 0
+        frames = wav.readframes(wav.getnframes())
+    arr = np.frombuffer(frames, dtype="<i2")
+    left = arr[0::2].astype(np.float64)
+    right = arr[1::2].astype(np.float64)
+    # Both directions captured → both channels carry energy.
+    assert np.sqrt(np.mean(left**2)) > 0
+    assert np.sqrt(np.mean(right**2)) > 0
+
+
+@pytest.mark.asyncio
+async def test_bridge_without_recorder_writes_nothing(tmp_path: Path) -> None:
+    """recorder=None → the bridge never touches the recordings dir."""
+    edge_session = MacosRtcSession()
+    engine_session = MacosRtcSession()
+    modem_up = PcmRingBuffer(capacity_bytes=8 * 1024, name="up")
+    modem_down = PcmRingBuffer(capacity_bytes=8 * 1024, name="down")
+    bridge = AudioBridge(
+        rtc_session=edge_session,
+        modem_upstream=modem_up,
+        modem_downstream=modem_down,
+        peer_uid="engine-c1",
+    )
+    await bridge.join(channel="c1", token="t", uid="edge-c1")
+    await engine_session.join(channel="c1", token="t", uid="engine-c1")
+    await modem_up.put(_tone(20, rate=8000))
+    await engine_session.push_audio(_tone(20, rate=16000), timestamp_ms=0)
+    up_iter = engine_session.audio_frames()
+    await asyncio.wait_for(anext(up_iter), timeout=1.0)
+    await asyncio.wait_for(modem_down.get(), timeout=1.0)
+    await bridge.leave()
+    await engine_session.leave()
+    assert list(tmp_path.glob("*.wav")) == []
 
 
 @pytest.mark.asyncio

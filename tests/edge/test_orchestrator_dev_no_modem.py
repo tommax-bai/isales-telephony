@@ -257,3 +257,90 @@ async def test_stop_in_dev_mode_tears_down_active_sessions():
     assert factory.sessions[0].leave_calls == 0
     await orch.stop()
     assert factory.sessions[0].leave_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# edge-local-call-recording (dev-no-modem path)
+# ---------------------------------------------------------------------------
+
+
+class _FrameYieldingRtcSession(_FakeRtcSession):
+    """A fake whose ``audio_frames()`` yields a preset list then ends."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__()
+        self._frames = frames
+
+    async def audio_frames(self) -> AsyncIterator[PcmFrame]:
+        for f in self._frames:
+            yield f
+            await asyncio.sleep(0)
+
+
+def test_downmix_playback_to_engine_mono():
+    import numpy as np
+
+    from isales_telephony.edge.orchestrator import _downmix_playback_to_engine_mono
+
+    # empty stays empty
+    assert _downmix_playback_to_engine_mono(b"", 48000, 2) == b""
+
+    # already 16 kHz mono → byte-identical (no conversion path taken)
+    mono = (np.ones(160) * 1234).astype("<i2").tobytes()
+    assert _downmix_playback_to_engine_mono(mono, 16000, 1) == mono
+
+    # 48 kHz stereo (L=1000, R=3000) → 16 kHz mono ≈ 2000, 6× fewer samples
+    n = 4800
+    inter = np.empty(n * 2, dtype="<i2")
+    inter[0::2] = 1000
+    inter[1::2] = 3000
+    out = np.frombuffer(
+        _downmix_playback_to_engine_mono(inter.tobytes(), 48000, 2), dtype="<i2",
+    )
+    assert out.size == 1600
+    assert abs(int(out.mean()) - 2000) <= 1
+
+
+@pytest.mark.asyncio
+async def test_dev_no_modem_records_ai_channel(tmp_path, monkeypatch):
+    """A dev-no-modem call with a recorder writes a stereo 16 kHz wav whose
+    right (AI) channel carries the downmixed playback PCM."""
+    import wave
+
+    import numpy as np
+
+    from isales_telephony.modem_controller.recorder import Recorder
+
+    # Skip the mic pump (no real mac mic in CI); left channel stays silent.
+    monkeypatch.setenv("ISALES_DEV_NO_MIC_CAPTURE", "1")
+
+    rec = Recorder(tmp_path, min_free_gb=0)
+    n = 4800  # 0.1 s @ 48 kHz stereo
+    inter = np.empty(n * 2, dtype="<i2")
+    inter[0::2] = 0      # remote/mixed left
+    inter[1::2] = 5000   # AI energy
+    frame = PcmFrame(sender_uid="", pcm=inter.tobytes(), sample_rate=48000, channels=2)
+    session = _FrameYieldingRtcSession([frame, frame, frame])
+
+    grpc = _FakeGrpcClient()
+    orch = EdgeOrchestrator(
+        grpc_client=grpc,
+        rtc_session_factory=lambda: session,
+        dev_no_modem=True,
+        recorder=rec,
+        max_recordings=5,
+    )
+    await orch.start()
+    await grpc.push_from_cloud(_make_dial("call-rec"))
+    await asyncio.sleep(0.05)  # let the AI pump drain the frames
+    await orch.stop()
+
+    wav_path = tmp_path / "call-rec.wav"
+    assert wav_path.exists()
+    with wave.open(str(wav_path)) as w:
+        assert w.getnchannels() == 2
+        assert w.getframerate() == 16000
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    # right (AI) channel non-silent; left (user, mic skipped) silent.
+    assert int(np.abs(data[:, 1]).mean()) > 1000
+    assert int(np.abs(data[:, 0]).max()) == 0

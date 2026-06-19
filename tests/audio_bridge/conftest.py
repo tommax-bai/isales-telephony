@@ -1,11 +1,16 @@
-"""Shared fakes for ``macos_artc_pyobjc`` tests.
+"""Shared fakes for the macOS PyObjC bridge tests.
 
-The bridge module top-levels ``import objc`` + ``from Foundation import
-NSObject``. We inject minimal fakes into ``sys.modules`` so the import
-succeeds on any host (no PyObjC required to test the wiring).
+Historically these fakes powered ``test_macos_artc_pyobjc_*`` against
+the legacy AliRTC binding. The dingrtc-migration § 8.9 deleted both
+``macos_artc_pyobjc.py`` and its test files; what remains here is the
+minimal fake-PyObjC surface still consumed by tests in
+``tests/audio_bridge/`` (e.g. the ``test_init_routing.py`` import path
+that loads ``macos_dingrtc_pyobjc`` under fake ``objc`` / ``Foundation``
+modules so the import resolves on hosts without PyObjC installed).
 
-Tests reimport the bridge module from a clean slate via the
-``fresh_bridge`` fixture so each test sees its own fake state.
+The ``fresh_bridge`` fixture is retained for any future macOS-bridge
+tests that need a reload-on-each-test pattern; it now reloads the
+DingRTC PyObjC module.
 """
 
 from __future__ import annotations
@@ -70,11 +75,25 @@ class _StubAliRtcEngine:
         return cls()
 
 
+def _fake_selector(callable_obj: Any, **_kwargs: Any) -> Any:
+    """Pass-through stand-in for ``objc.selector``.
+
+    The real ``objc.selector(fn, signature=b'...')`` attaches an
+    Objective-C method-type-encoding metadata to ``fn`` so the SDK can
+    invoke it across the Cocoa/Python ABI without misinterpreting
+    primitive args. Tests don't exercise that ABI (no SDK present), so
+    we return the underlying callable unchanged — Python-side callers
+    still see the function with its normal Python signature.
+    """
+    return callable_obj
+
+
 def _make_fake_objc() -> ModuleType:
     mod = ModuleType("objc")
     mod.loadBundle = _default_load_bundle  # type: ignore[attr-defined]
     mod.super = _FakeObjcSuper  # type: ignore[attr-defined]
     mod.error = type("error", (Exception,), {})  # type: ignore[attr-defined]
+    mod.selector = _fake_selector  # type: ignore[attr-defined]
     return mod
 
 
@@ -103,6 +122,6 @@ def fresh_bridge(monkeypatch: pytest.MonkeyPatch):
     fake_foundation = _make_fake_foundation()
     monkeypatch.setitem(sys.modules, "objc", fake_objc)
     monkeypatch.setitem(sys.modules, "Foundation", fake_foundation)
-    import isales_telephony.audio_bridge.macos_artc_pyobjc as bridge
+    import isales_telephony.audio_bridge.macos_dingrtc_pyobjc as bridge
     bridge = importlib.reload(bridge)
     return fake_objc, fake_foundation, bridge
