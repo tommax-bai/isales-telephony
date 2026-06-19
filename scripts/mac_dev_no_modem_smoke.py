@@ -87,11 +87,17 @@ DEFAULT_RTC_FRAMEWORK = os.path.expanduser(
 # --record default dir (edge-local-call-recording). The spawned edge's
 # _build_recorder() reads ISALES_EDGE_RECORDINGS_DIR; --record just sets it.
 DEFAULT_RECORDINGS_DIR = "~/isales-recordings"
-META_REPO_ENGINE_ENV = "/Users/bears/codes/isales/deploy/cloud/env/engine.env"
-TELEPHONY_VENV_PY = "/Users/bears/codes/isales-telephony/.venv/bin/python"
-TELEPHONY_EDGE_BIN = (
-    "/Users/bears/codes/isales-telephony/.venv/bin/isales-telephony-edge"
-)
+# Derive repo paths from this file's location so the smoke runs on any dev
+# machine, not just the original author's. scripts/ → isales-telephony/ repo
+# root → sibling meta-repo `isales`. Both this layout (~/isales-telephony +
+# ~/isales) and the author's (~/codes/isales-telephony + ~/codes/isales)
+# resolve correctly. Override the meta-repo path via ISALES_META_REPO if your
+# checkout isn't a sibling of isales-telephony.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_META_REPO = Path(os.environ.get("ISALES_META_REPO", str(_REPO_ROOT.parent / "isales")))
+META_REPO_ENGINE_ENV = str(_META_REPO / "deploy/cloud/env/engine.env")
+TELEPHONY_VENV_PY = str(_REPO_ROOT / ".venv/bin/python")
+TELEPHONY_EDGE_BIN = str(_REPO_ROOT / ".venv/bin/isales-telephony-edge")
 EDGE_LOG_PATH = Path("/tmp/isales-edge-mac-dev.log")
 LOCAL_JWT_PATH = Path("/tmp/isales-edge-01.jwt")
 REMOTE_INJECT_PATH = "/tmp/_remote_inject_dial.py"
